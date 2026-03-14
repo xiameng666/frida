@@ -631,7 +631,8 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_attach)
   }
 
   auto attach_ret = gum_interceptor_attach (module->interceptor, target,
-      GUM_INVOCATION_LISTENER (listener), listener_function_data);
+      GUM_INVOCATION_LISTENER (listener), listener_function_data,
+      GUM_ATTACH_FLAGS_NONE);
 
   if (attach_ret == GUM_ATTACH_OK)
   {

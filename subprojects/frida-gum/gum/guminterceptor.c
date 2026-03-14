@@ -423,7 +423,8 @@ GumAttachReturn
 gum_interceptor_attach (GumInterceptor * self,
                         gpointer function_address,
                         GumInvocationListener * listener,
-                        gpointer listener_function_data)
+                        gpointer listener_function_data,
+                        GumAttachFlags flags)
 {
   GumAttachReturn result = GUM_ATTACH_OK;
   GumFunctionContext * function_ctx;
@@ -444,6 +445,9 @@ gum_interceptor_attach (GumInterceptor * self,
 
   if (gum_function_context_has_listener (function_ctx, listener))
     goto already_attached;
+
+  if ((flags & GUM_ATTACH_FLAGS_STEALTH) != 0)
+    function_ctx->stealth = TRUE;
 
   gum_function_context_add_listener (function_ctx, listener,
       listener_function_data);
@@ -1079,6 +1083,47 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
     rwx_supported = gum_query_is_rwx_supported ();
     code_segment_supported = gum_code_segment_is_supported ();
 
+    /*
+     * stealth hook 无需经过 mprotect (RW → write) 流程
+     * 因为 wxjump KPM 通过内核 PTE 操作 shadow page, 用户态无需可写权限
+     * 先提取并直接执行所有 stealth 任务, 再让非 stealth 任务走原有路径
+     */
+    {
+      gboolean has_non_stealth = FALSE;
+
+      for (cur = addresses; cur != NULL; cur = cur->next)
+      {
+        gpointer target_page = cur->data;
+        GArray * pending;
+        guint i;
+
+        pending = g_hash_table_lookup (self->pending_update_tasks,
+            target_page);
+        if (pending == NULL)
+          continue;
+
+        for (i = 0; i != pending->len; i++)
+        {
+          GumUpdateTask * update;
+
+          update = &g_array_index (pending, GumUpdateTask, i);
+
+          if (update->ctx->stealth)
+          {
+            update->func (interceptor, update->ctx,
+                _gum_interceptor_backend_get_function_address (update->ctx));
+          }
+          else
+          {
+            has_non_stealth = TRUE;
+          }
+        }
+      }
+
+      if (!has_non_stealth)
+        goto skip_normal_patching;
+    }
+
     if (rwx_supported || !code_segment_supported)
     {
       GumPageProtection protection;
@@ -1114,6 +1159,10 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
           GumUpdateTask * update;
 
           update = &g_array_index (pending, GumUpdateTask, i);
+
+          /* stealth hook 已在上面处理, 此处跳过 */
+          if (update->ctx->stealth)
+            continue;
 
           update->func (interceptor, update->ctx,
               _gum_interceptor_backend_get_function_address (update->ctx));
@@ -1221,6 +1270,9 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
 
       gum_code_segment_free (segment);
     }
+
+skip_normal_patching:
+    ;
   }
 
   g_list_free (addresses);

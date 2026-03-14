@@ -40,11 +40,13 @@ main (int argc,
       GSIZE_TO_POINTER (gum_module_find_global_export_by_name ("open")),
       listener,
       GSIZE_TO_POINTER (EXAMPLE_HOOK_OPEN),
+      GUM_ATTACH_FLAGS_NONE,
       GUM_ATTACH_FLAGS_NONE);
   gum_interceptor_attach (interceptor,
       GSIZE_TO_POINTER (gum_module_find_global_export_by_name ("close")),
       listener,
       GSIZE_TO_POINTER (EXAMPLE_HOOK_CLOSE),
+      GUM_ATTACH_FLAGS_NONE,
       GUM_ATTACH_FLAGS_NONE);
   gum_interceptor_end_transaction (interceptor);
 

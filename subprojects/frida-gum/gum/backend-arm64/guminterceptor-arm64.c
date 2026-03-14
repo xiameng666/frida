@@ -13,6 +13,7 @@
 #include "gumcloak.h"
 #include "gumlibc.h"
 #include "gummemory.h"
+#include "gumstealth.h"
 #ifdef HAVE_DARWIN
 # include "gum/gumdarwin.h"
 # include "gumdarwingrafter-priv.h"
@@ -931,6 +932,33 @@ _gum_interceptor_backend_activate_trampoline (GumInterceptorBackend * self,
   }
 #endif
 
+  /*
+   * stealth 模式: 将跳转指令写入 wxjump shadow page 而非原始代码页
+   *
+   * 工作原理:
+   * 1. 构造跳转指令 (LDR+BR) 到临时栈缓冲区
+   * 2. 通过 prctl → wxjump KPM 将指令写入 shadow page
+   * 3. wxjump 切换 PTE: 执行走 shadow (--x), 读取走 original (r--)
+   * 4. CRC 检测读取原始字节 → 完全无感
+   */
+  if (ctx->stealth && gum_stealth_is_available ())
+  {
+    guint8 jump_buf[16];
+
+    gum_arm64_writer_reset (aw, jump_buf);
+    aw->pc = GUM_ADDRESS (ctx->function_address);
+
+    /* stealth 模式始终使用完整 16 字节跳转 (LDR Xn, #8; BR Xn; .quad addr)
+     * 因为 shadow page 不受空间限制, 无需使用短跳转或 deflector */
+    gum_arm64_writer_put_ldr_reg_address (aw, data->scratch_reg, on_enter);
+    gum_arm64_writer_put_br_reg (aw, data->scratch_reg);
+    gum_arm64_writer_flush (aw);
+
+    gum_stealth_patch (ctx->function_address,
+        jump_buf, gum_arm64_writer_offset (aw));
+    return;
+  }
+
   gum_arm64_writer_reset (aw, prologue);
   aw->pc = GUM_ADDRESS (ctx->function_address);
 
@@ -991,6 +1019,13 @@ _gum_interceptor_backend_deactivate_trampoline (GumInterceptorBackend * self,
     return;
   }
 #endif
+
+  /* stealth 模式: 通过 wxjump KPM 释放 shadow page patch */
+  if (ctx->stealth)
+  {
+    gum_stealth_release (ctx->function_address, ctx->overwritten_prologue_len);
+    return;
+  }
 
   gum_memcpy (prologue, ctx->overwritten_prologue,
       ctx->overwritten_prologue_len);

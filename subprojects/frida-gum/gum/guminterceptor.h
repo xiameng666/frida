@@ -24,6 +24,12 @@ typedef void (* GumInterceptorLockedFunc) (gpointer user_data);
 
 typedef enum
 {
+  GUM_ATTACH_FLAGS_NONE    = 0,
+  GUM_ATTACH_FLAGS_STEALTH = (1 << 0),
+} GumAttachFlags;
+
+typedef enum
+{
   GUM_ATTACH_OK               =  0,
   GUM_ATTACH_WRONG_SIGNATURE  = -1,
   GUM_ATTACH_ALREADY_ATTACHED = -2,
@@ -44,7 +50,7 @@ GUM_API GumInterceptor * gum_interceptor_obtain (void);
 
 GUM_API GumAttachReturn gum_interceptor_attach (GumInterceptor * self,
     gpointer function_address, GumInvocationListener * listener,
-    gpointer listener_function_data);
+    gpointer listener_function_data, GumAttachFlags flags);
 GUM_API void gum_interceptor_detach (GumInterceptor * self,
     GumInvocationListener * listener);
 

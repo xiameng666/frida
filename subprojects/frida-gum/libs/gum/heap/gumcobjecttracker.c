@@ -433,7 +433,8 @@ gum_cobject_tracker_attach_to_function (GumCObjectTracker * self,
   g_ptr_array_add (self->function_contexts, function_ctx);
 
   gum_interceptor_attach (self->interceptor, function_address,
-      GUM_INVOCATION_LISTENER (self), function_ctx);
+      GUM_INVOCATION_LISTENER (self), function_ctx,
+      GUM_ATTACH_FLAGS_NONE);
 }
 
 static void

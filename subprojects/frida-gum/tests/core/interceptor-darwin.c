@@ -398,7 +398,8 @@ attach_if_function_export (const GumExportDetails * details,
     GumAttachReturn attach_ret;
 
     attach_ret = gum_interceptor_attach (ctx->interceptor,
-        GSIZE_TO_POINTER (details->address), ctx->listener, NULL);
+        GSIZE_TO_POINTER (details->address), ctx->listener, NULL,
+      GUM_ATTACH_FLAGS_NONE);
     if (attach_ret == GUM_ATTACH_OK)
     {
       ctx->count++;

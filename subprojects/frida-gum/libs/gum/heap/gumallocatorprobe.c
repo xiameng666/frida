@@ -630,7 +630,8 @@ attach_to_function (GumAllocatorProbe * self,
   g_ptr_array_add (self->function_contexts, function_ctx);
 
   gum_interceptor_attach (self->interceptor, function_address, listener,
-      function_ctx);
+      function_ctx,
+      GUM_ATTACH_FLAGS_NONE);
 }
 
 void
@@ -639,7 +640,8 @@ gum_allocator_probe_suppress (GumAllocatorProbe * self,
 {
   GumInvocationListener * listener = GUM_INVOCATION_LISTENER (self);
 
-  gum_interceptor_attach (self->interceptor, function_address, listener, NULL);
+  gum_interceptor_attach (self->interceptor, function_address, listener, NULL,
+      GUM_ATTACH_FLAGS_NONE);
 }
 
 static void

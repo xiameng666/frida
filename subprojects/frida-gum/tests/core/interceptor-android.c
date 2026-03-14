@@ -30,7 +30,8 @@ TESTCASE (can_attach_to_close_with_two_unrelated_interceptors)
   interceptor_fixture_attach (fixture, 0, close_impl, '>', '<');
 
   gum_interceptor_attach (other_interceptor, close_impl,
-      GUM_INVOCATION_LISTENER (fixture->listener_context[0]->listener), NULL);
+      GUM_INVOCATION_LISTENER (fixture->listener_context[0]->listener), NULL,
+      GUM_ATTACH_FLAGS_NONE);
 
   close_impl (fd);
 

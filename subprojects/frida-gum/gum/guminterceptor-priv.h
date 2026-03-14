@@ -43,6 +43,7 @@ struct _GumFunctionContext
   guint8 destroyed;
   guint8 activated;
   guint8 has_on_leave_listener;
+  guint8 stealth;
 
   GumCodeSlice * trampoline_slice;
   GumCodeDeflector * trampoline_deflector;

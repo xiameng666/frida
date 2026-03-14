@@ -52,11 +52,13 @@ main (int argc,
       GSIZE_TO_POINTER (gum_module_find_export_by_name (user32, "MessageBeep")),
       listener,
       GSIZE_TO_POINTER (EXAMPLE_HOOK_MESSAGE_BEEP),
+      GUM_ATTACH_FLAGS_NONE,
       GUM_ATTACH_FLAGS_NONE);
   gum_interceptor_attach (interceptor,
       GSIZE_TO_POINTER (gum_module_find_export_by_name (kernel32, "Sleep")),
       listener,
       GSIZE_TO_POINTER (EXAMPLE_HOOK_SLEEP),
+      GUM_ATTACH_FLAGS_NONE,
       GUM_ATTACH_FLAGS_NONE);
   gum_interceptor_end_transaction (interceptor);
 

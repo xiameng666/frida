@@ -1,0 +1,91 @@
+option('frida_version',
+  type: 'string',
+  value: '',
+  description: 'Frida version, such as 16.2.2 or 16.2.2-dev.27',
+)
+
+option('graft_tool',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build gum-graft tool',
+)
+
+option('diet',
+  type: 'boolean',
+  value: false,
+  description: 'Optimize for minimal footprint'
+)
+
+option('allocator',
+  type: 'combo',
+  choices: ['auto', 'internal', 'system'],
+  value: 'auto',
+  description: 'Which memory allocator to use'
+)
+
+option('jailbreak',
+  type: 'feature',
+  value: 'auto',
+  description: 'Include jailbreak-specific integrations'
+)
+
+option('gumpp',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Build C++ bindings'
+)
+
+option('gumjs',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Build JavaScript bindings'
+)
+
+option('quickjs',
+  type: 'feature',
+  value: 'enabled',
+  description: 'Build JavaScript bindings with QuickJS runtime included'
+)
+
+option('v8',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build JavaScript bindings with V8 runtime included'
+)
+
+option('database',
+  type: 'feature',
+  value: 'enabled',
+  description: 'Build JavaScript bindings with Database API included'
+)
+
+option('frida_objc_bridge',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build JavaScript bindings with ObjC bridge included'
+)
+
+option('frida_swift_bridge',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build JavaScript bindings with Swift bridge included'
+)
+
+option('frida_java_bridge',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build JavaScript bindings with Java bridge included'
+)
+
+option('devkits',
+  type: 'array',
+  choices: ['gum', 'gumjs'],
+  value: [],
+  description: 'Devkits to build'
+)
+
+option('tests',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build tests'
+)

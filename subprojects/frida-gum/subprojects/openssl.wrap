@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/frida/openssl.git
+revision = ca4781aaf7910b623d3ae21c6a017e7e9ca6936c
+depth = 1
+
+[provide]
+dependency_names = openssl libcrypto libssl
+

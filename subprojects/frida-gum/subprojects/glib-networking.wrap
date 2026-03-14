@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/frida/glib-networking.git
+revision = af4b017028e695528951c749a7096e96359521d8
+depth = 1
+
+[provide]
+dependency_names = gioopenssl
+

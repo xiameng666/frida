@@ -1,0 +1,20 @@
+task:
+  name: freebsd-x86_64
+  freebsd_instance:
+    image_family: freebsd-14-0
+  install_script: |
+    pkg install -y \
+      git \
+      npm
+  compile_script: |
+    ./configure \
+        --enable-gumpp \
+        --enable-gumjs \
+        --with-devkits=gum,gumjs \
+        --enable-tests
+    make
+  gum_devkit_artifacts:
+    path: "build/gum/devkit/*"
+  gumjs_devkit_artifacts:
+    path: "build/bindings/gumjs/devkit/*"
+  test_script: make test

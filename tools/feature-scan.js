@@ -583,6 +583,125 @@ function rDebug() {
        lines.join('\n') + `\n---- ${idx} entries ----`);
 }
 
+// ---------------- link_map 链表 + DT_SONAME (dexprotect WD4 走的就是这条) ----------------
+// dexprotect 把 r_debug.r_map 拿到, 沿 l_next 遍历每个 link_map, 对每个 DSO:
+//   1) 检查 l_name (路径字符串) 是否含子串: frida / /memfd: / jvmti.so / jdwp.so
+//   2) 走 l_ld (PT_DYNAMIC) 找 DT_STRTAB / DT_STRSZ / DT_SONAME, 取出 SONAME 字符串
+//      检查 SONAME 是否含: frida / -agent-raw.so
+//   命中即 SIGKILL.
+// 我们自己跑这套, 看看 frida agent 的 l_name + SONAME 各是什么, 验证改名是否到位.
+function linkMap() {
+  // 三路找 r_debug 地址 (与 rDebug() 共用同一套兜底)
+  let r_debug = exp('_r_debug');
+  let how = r_debug ? 'libc/global _r_debug' : null;
+  if (r_debug === null) {
+    for (const ln of ['linker64', 'linker', 'ld-android.so']) {
+      try {
+        const m = Process.getModuleByName(ln);
+        r_debug = m.findExportByName('_r_debug');
+        if (r_debug) { how = ln + '!_r_debug'; break; }
+        r_debug = m.findExportByName('__dl__r_debug');
+        if (r_debug) { how = ln + '!__dl__r_debug'; break; }
+      } catch (e) {}
+    }
+  }
+  if (r_debug === null) {
+    r_debug = findRDebugViaDtDebug();
+    if (r_debug) how = 'PT_DYNAMIC/DT_DEBUG';
+  }
+  if (!r_debug || r_debug.isNull()) {
+    dump('link_map walk', '<找不到 r_debug>');
+    return;
+  }
+
+  const lines = [`r_debug @ ${r_debug}  (via ${how})  r_version=${r_debug.readS32()}  r_map=${r_debug.add(8).readPointer()}`];
+  lines.push('');
+  lines.push('[idx]  l_addr            l_name                                          DT_SONAME');
+  lines.push('-----  ----------------  ----------------------------------------------  --------------------------');
+
+  const DT_NULL = 0, DT_STRTAB = 5, DT_STRSZ = 10, DT_SONAME = 14;
+
+  // dexprotect 子串黑名单 (来自 dpx_link_map_soname_blacklist):
+  const HIT_LNAME = [
+    'frida',          // l_name 含 frida 即杀
+    '/memfd:',        // l_name 以 /memfd: 开头即杀  <- 关键!
+    'jvmti.so',
+    'jdwp.so',
+  ];
+  const HIT_SONAME = [
+    'frida',
+    '-agent-raw.so',  // 包括老的 libfrida-agent-raw.so   <- 关键!
+  ];
+
+  let idx = 0, hits = 0;
+  let cur = r_debug.add(8).readPointer();   // r_debug.r_map -> 第一个 link_map
+
+  while (!cur.isNull() && idx < 1024) {
+    let l_addr, l_name_ptr, l_ld, l_next, l_name;
+    try {
+      l_addr     = cur.readPointer();
+      l_name_ptr = cur.add(8).readPointer();
+      l_ld       = cur.add(16).readPointer();
+      l_next     = cur.add(24).readPointer();
+      l_name     = l_name_ptr.isNull() ? '' : (l_name_ptr.readCString() || '');
+    } catch (e) {
+      lines.push(`${String(idx).padStart(5)}  <read error at ${cur}: ${e.message}>`);
+      break;
+    }
+
+    // 走 l_ld (PT_DYNAMIC) 找 SONAME
+    let soname = '';
+    try {
+      if (!l_ld.isNull()) {
+        let strtab = NULL, strsz = 0, soname_off = -1;
+        let p = l_ld;
+        for (let i = 0; i < 4096; i++) {
+          const tag = p.readU64().valueOf();
+          if (tag === DT_NULL) break;
+          if (tag === DT_STRTAB) {
+            const v = p.add(8).readPointer();
+            // bionic 在加载时已经把 DT_STRTAB 的 d_ptr 改写成绝对地址
+            strtab = v;
+          } else if (tag === DT_STRSZ) {
+            strsz = p.add(8).readU64().valueOf();
+          } else if (tag === DT_SONAME) {
+            soname_off = p.add(8).readU64().valueOf();
+          }
+          p = p.add(16);
+        }
+        if (!strtab.isNull() && soname_off >= 0 && soname_off < strsz + 1024) {
+          // 有些库 strtab 是相对地址, 加上 l_addr 兜底
+          let s = '';
+          try { s = strtab.add(soname_off).readCString() || ''; } catch (e) {}
+          if (s === '' && !l_addr.isNull()) {
+            try { s = l_addr.add(strtab).add(soname_off).readCString() || ''; } catch (e) {}
+          }
+          soname = s;
+        }
+      }
+    } catch (e) {}
+
+    // 标可疑
+    let mark = '   ';
+    for (const k of HIT_LNAME)  if (l_name.indexOf(k)  !== -1) { mark = '!! '; break; }
+    if (mark === '   ') for (const k of HIT_SONAME) if (soname.indexOf(k) !== -1) { mark = '!! '; break; }
+    if (mark === '!! ') hits++;
+
+    const namePart = (l_name || '<null>').padEnd(46);
+    const soPart   = soname || '';
+    lines.push(`${mark}${String(idx).padStart(5)}  ${l_addr.toString().padEnd(18)}${namePart}  ${soPart}`);
+
+    cur = l_next;
+    idx++;
+  }
+
+  lines.push('');
+  lines.push(`---- 总条目: ${idx},  dexprotect 命中: ${hits} ----`);
+  lines.push(`---- 行首 [!!] = l_name 含 frida//memfd:/jvmti.so/jdwp.so, 或 SONAME 含 frida/-agent-raw.so ----`);
+  dump('link_map link_map (DT_SONAME, dexprotect WD4 视角)', lines.join('\n'));
+  return hits;
+}
+
 // ---------------- bionic solist (Android 专用, 内部链表) ----------------
 // 走 linker64 的私有符号 __dl__ZL6solist (mangled, "solist")
 // 每个 soinfo 节点结构在不同 Android 版本不同, 这里只读 next + base + size_or_name
@@ -711,7 +830,7 @@ function hookDlopen() {
 rpc.exports = {
   all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
   threads, fds, unix, tmp, hookDlopen,
-  dlIter, rDebug, soList,
+  dlIter, rDebug, soList, linkMap,
   detect,
 };
 
@@ -719,7 +838,7 @@ rpc.exports = {
 Object.assign(globalThis, {
   all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
   threads, fds, unix, tmp, hookDlopen,
-  dlIter, rDebug, soList,
+  dlIter, rDebug, soList, linkMap,
   detect,
 });
 
@@ -732,6 +851,7 @@ console.log('  smaps() / smapsFilt()');
 console.log('  threads() fds() unix() status() cmdline() tmp([name])');
 console.log('  dlIter()    dl_iterate_phdr 公开 API 枚举 so');
 console.log('  rDebug()    遍历 _r_debug.r_map (link_map 链表)');
+console.log('  linkMap()   link_map 链表 + DT_SONAME (dexprotect WD4 走的就是这条!)');
 console.log('  soList()    遍历 bionic linker 私有 solist (Android)');
 console.log('  all()       一把全跑 (打印各 /proc 接口原始内容)');
 console.log('  detect()    模拟反 frida 检测器, 给出强/弱特征汇总报告');

@@ -44,7 +44,7 @@ if host_os_family in ['linux', 'qnx']
   extra_link_args += '-Wl,-Bsymbolic'
 endif
 
-raw_agent = shared_library('frida-agent-raw', agent_sources,
+raw_agent = shared_library('xiam-raw', agent_sources,
   name_prefix: 'lib',
   c_args: frida_component_cflags,
   vala_header: 'frida-agent.h',

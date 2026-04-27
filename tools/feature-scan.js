@@ -860,6 +860,52 @@ function soList() {
        lines.join('\n') + `\n---- ${idx} entries (字段偏移按 Android 11+ 估算, 名字若错请按版本核对偏移) ----`);
 }
 
+// ---------------- 触发 frida agent 自摘链 ----------------
+// 调用 agent 内部导出的 xiam_unlink_self(), 把自己从 solist + r_debug.r_map
+// 双链表里摘掉. 调完再跑 linkMap() 应该看不到 xiam-64.so.
+function unlinkSelf() {
+  // 1) findGlobalExportByName 不一定枚举到 memfd-loaded agent, 试着先用
+  let sym = null;
+  try { sym = Module.findGlobalExportByName('xiam_unlink_self'); } catch (e) {}
+
+  // 2) 找不到就显式枚举所有模块 (含 memfd:xiam-64.so), 在含 'xiam' 的模块里 findExportByName
+  if (sym === null) {
+    const mods = Process.enumerateModules();
+    console.log(`[unlink] enumerated ${mods.length} modules, searching xiam-* ...`);
+    for (const m of mods) {
+      if (!/xiam/i.test(m.name) && !/xiam/i.test(m.path || '')) continue;
+      console.log(`[unlink] candidate: name=${m.name} path=${m.path} base=${m.base}`);
+      try {
+        const s = m.findExportByName('xiam_unlink_self');
+        if (s) { sym = s; break; }
+      } catch (e) {}
+    }
+  }
+
+  // 3) 最后兜底: 用 dlsym(RTLD_DEFAULT)
+  if (sym === null) {
+    try {
+      const dlsym = new NativeFunction(
+        libc.findExportByName('dlsym') || Module.getGlobalExportByName('dlsym'),
+        'pointer', ['pointer', 'pointer']);
+      const RTLD_DEFAULT = ptr('0');
+      const s = dlsym(RTLD_DEFAULT, Memory.allocUtf8String('xiam_unlink_self'));
+      if (!s.isNull()) sym = s;
+    } catch (e) {}
+  }
+
+  if (sym === null) {
+    console.log('[unlink] xiam_unlink_self 三种方式都找不到, 检查 agent 是否更新');
+    return -1;
+  }
+
+  console.log(`[unlink] resolved symbol @ ${sym}`);
+  const fn = new NativeFunction(sym, 'int', []);
+  const ret = fn();
+  console.log(`[unlink] xiam_unlink_self() = ${ret}  ${ret === 0 ? '(ok)' : '(failed, see logcat -s xiam-unlink)'}`);
+  return ret;
+}
+
 // ---------------- dlopen 拦截 ----------------
 function hookDlopen() {
   const targets = ['android_dlopen_ext', 'dlopen'];
@@ -914,6 +960,7 @@ rpc.exports = {
   all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
   threads, fds, unix, tmp, hookDlopen,
   dlIter, rDebug, soList, linkMap,
+  unlinkSelf,
   detect,
 };
 
@@ -922,6 +969,7 @@ Object.assign(globalThis, {
   all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
   threads, fds, unix, tmp, hookDlopen,
   dlIter, rDebug, soList, linkMap,
+  unlinkSelf,
   detect,
 });
 

@@ -3,6 +3,10 @@ agent_sources = [
   'agent-glue.c',
 ]
 
+if host_os_family == 'linux' and host_os == 'android'
+  agent_sources += ['agent-unlink.c']
+endif
+
 force_cpp_linking = have_v8
 if force_cpp_linking
   agent_sources += ['dummy.cpp']

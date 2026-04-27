@@ -457,6 +457,86 @@ function _detectFds() {
   return hits.length;
 }
 
+// 走 r_debug.r_map, 对 l_name 与 DT_SONAME 双字段做子串匹配,
+// 命中即视为可被风控识别 (与 dpx 视角等同, 但不依赖具体厂商).
+function _detectLinkMap() {
+  console.log('\n----- [6] r_debug.r_map + DT_SONAME -----');
+
+  // 找 r_debug
+  let r_debug = exp('_r_debug');
+  if (r_debug === null) {
+    for (const ln of ['linker64', 'linker', 'ld-android.so']) {
+      try {
+        const m = Process.getModuleByName(ln);
+        r_debug = m.findExportByName('_r_debug') || m.findExportByName('__dl__r_debug');
+        if (r_debug) break;
+      } catch (e) {}
+    }
+  }
+  if (r_debug === null) r_debug = findRDebugViaDtDebug();
+  if (!r_debug || r_debug.isNull()) {
+    console.log('  [skip] r_debug 找不到');
+    return 0;
+  }
+
+  const DT_NULL = 0, DT_STRTAB = 5, DT_STRSZ = 10, DT_SONAME = 14;
+  const HIT_LNAME  = ['frida', '/memfd:', 'jvmti.so', 'jdwp.so'];
+  const HIT_SONAME = ['frida', '-agent-raw.so'];
+
+  let total = 0, hits = [];
+  let cur = r_debug.add(8).readPointer();
+  while (!cur.isNull() && total < 1024) {
+    let l_addr, l_name_ptr, l_ld, l_next, l_name;
+    try {
+      l_addr     = cur.readPointer();
+      l_name_ptr = cur.add(8).readPointer();
+      l_ld       = cur.add(16).readPointer();
+      l_next     = cur.add(24).readPointer();
+      l_name     = l_name_ptr.isNull() ? '' : (l_name_ptr.readCString() || '');
+    } catch (e) { break; }
+
+    let soname = '';
+    try {
+      if (!l_ld.isNull()) {
+        let strtab = NULL, strsz = 0, soname_off = -1;
+        let p = l_ld;
+        for (let i = 0; i < 4096; i++) {
+          const tag = p.readU64().valueOf();
+          if (tag === DT_NULL) break;
+          if (tag === DT_STRTAB)      strtab = p.add(8).readPointer();
+          else if (tag === DT_STRSZ)  strsz = p.add(8).readU64().valueOf();
+          else if (tag === DT_SONAME) soname_off = p.add(8).readU64().valueOf();
+          p = p.add(16);
+        }
+        if (!strtab.isNull() && soname_off >= 0 && soname_off < strsz + 1024) {
+          try { soname = strtab.add(soname_off).readCString() || ''; } catch (e) {}
+          if (soname === '' && !l_addr.isNull()) {
+            try { soname = l_addr.add(strtab).add(soname_off).readCString() || ''; } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+
+    let why = [];
+    for (const k of HIT_LNAME)  if (l_name.indexOf(k)  !== -1) why.push(`l_name~${k}`);
+    for (const k of HIT_SONAME) if (soname.indexOf(k) !== -1) why.push(`SONAME~${k}`);
+    if (why.length) {
+      hits.push(`${l_addr.toString().padEnd(18)} ${(l_name || '<null>').padEnd(46)} ${soname}    [${why.join(',')}]`);
+    }
+
+    cur = l_next;
+    total++;
+  }
+
+  if (hits.length === 0) {
+    console.log(`  [OK] link_map 总=${total}, 无命中`);
+  } else {
+    console.log(`  [!!] link_map 总=${total}, 命中=${hits.length}:`);
+    hits.forEach(l => console.log('       ' + l));
+  }
+  return hits.length;
+}
+
 function _detectPorts() {
   console.log('\n----- [5] /proc/net/tcp[6] (frida 知名端口) -----');
   const KNOWN = [27042, 27043, 27052, 27053, 14725, 14735];
@@ -483,23 +563,26 @@ function detect() {
   const s = _detectSo();
   const f = _detectFds();
   const p = _detectPorts();
-  const total = m + t + s + f + p;
+  const d = _detectLinkMap();
+  const total = m + t + s + f + p + d;
   console.log('\n========== SUMMARY ==========');
-  console.log(`  maps   强特征: ${m}`);
-  console.log(`  thread 强特征: ${t}`);
-  console.log(`  so 链表强特征: ${s}`);
-  console.log(`  fd     强特征: ${f}`);
-  console.log(`  ports  命中: ${p}`);
+  console.log(`  maps   强特征:        ${m}`);
+  console.log(`  thread 强特征:        ${t}`);
+  console.log(`  so 链表强特征:        ${s}`);
+  console.log(`  fd     强特征:        ${f}`);
+  console.log(`  ports  命中:          ${p}`);
+  console.log(`  link_map 命中:        ${d}    (l_name + DT_SONAME 双字段)`);
   console.log(total === 0
     ? '\n  [PASS] 当前进程未被检出 frida 特征'
     : `\n  [FAIL] 共 ${total} 处特征命中, 风控可识别 frida`);
 }
-// detect 子模块用法: detect.maps() / detect.threads() / detect.so() / detect.fds() / detect.ports()
+// detect 子模块用法: detect.maps() / detect.threads() / detect.so() / detect.fds() / detect.ports() / detect.linkMap()
 detect.maps    = _detectMaps;
 detect.threads = _detectThreads;
 detect.so      = _detectSo;
 detect.fds     = _detectFds;
 detect.ports   = _detectPorts;
+detect.linkMap = _detectLinkMap;
 
 // ---------------- dl_iterate_phdr 遍历 ----------------
 // 这是公开 API, 风控最常用. 标准 glibc/bionic 都有.
@@ -583,12 +666,12 @@ function rDebug() {
        lines.join('\n') + `\n---- ${idx} entries ----`);
 }
 
-// ---------------- link_map 链表 + DT_SONAME (dexprotect WD4 走的就是这条) ----------------
-// dexprotect 把 r_debug.r_map 拿到, 沿 l_next 遍历每个 link_map, 对每个 DSO:
+// ---------------- link_map 链表 + DT_SONAME ----------------
+// 走 r_debug.r_map 拿到链表头, 沿 l_next 遍历每个 link_map, 对每个 DSO:
 //   1) 检查 l_name (路径字符串) 是否含子串: frida / /memfd: / jvmti.so / jdwp.so
-//   2) 走 l_ld (PT_DYNAMIC) 找 DT_STRTAB / DT_STRSZ / DT_SONAME, 取出 SONAME 字符串
+//   2) 走 l_ld (PT_DYNAMIC) 找 DT_STRTAB / DT_STRSZ / DT_SONAME, 取 SONAME 字符串
 //      检查 SONAME 是否含: frida / -agent-raw.so
-//   命中即 SIGKILL.
+// 这是常见风控的检测路径, 命中通常意味着进程被 SIGKILL.
 // 我们自己跑这套, 看看 frida agent 的 l_name + SONAME 各是什么, 验证改名是否到位.
 function linkMap() {
   // 三路找 r_debug 地址 (与 rDebug() 共用同一套兜底)
@@ -696,9 +779,9 @@ function linkMap() {
   }
 
   lines.push('');
-  lines.push(`---- 总条目: ${idx},  dexprotect 命中: ${hits} ----`);
+  lines.push(`---- 总条目: ${idx},  命中: ${hits} ----`);
   lines.push(`---- 行首 [!!] = l_name 含 frida//memfd:/jvmti.so/jdwp.so, 或 SONAME 含 frida/-agent-raw.so ----`);
-  dump('link_map link_map (DT_SONAME, dexprotect WD4 视角)', lines.join('\n'));
+  dump('link_map (l_name + DT_SONAME)', lines.join('\n'));
   return hits;
 }
 
@@ -851,7 +934,7 @@ console.log('  smaps() / smapsFilt()');
 console.log('  threads() fds() unix() status() cmdline() tmp([name])');
 console.log('  dlIter()    dl_iterate_phdr 公开 API 枚举 so');
 console.log('  rDebug()    遍历 _r_debug.r_map (link_map 链表)');
-console.log('  linkMap()   link_map 链表 + DT_SONAME (dexprotect WD4 走的就是这条!)');
+console.log('  linkMap()   link_map 链表 + DT_SONAME (常见风控视角)');
 console.log('  soList()    遍历 bionic linker 私有 solist (Android)');
 console.log('  all()       一把全跑 (打印各 /proc 接口原始内容)');
 console.log('  detect()    模拟反 frida 检测器, 给出强/弱特征汇总报告');

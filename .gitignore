@@ -1,6 +1,17 @@
 /build/
 /deps/
+/.codex/
+/2026-*-stealth-frida17x.txt
 /releng/__pycache__/
 /releng/modules/frida-gadget-ios/*.dylib
 /releng/modules/frida-gadget-ios/node_modules
 /subprojects/*
+!/subprojects/frida-clr
+!/subprojects/frida-core
+!/subprojects/frida-go
+!/subprojects/frida-gum
+!/subprojects/frida-node
+!/subprojects/frida-python
+!/subprojects/frida-qml
+!/subprojects/frida-swift
+!/subprojects/frida-tools

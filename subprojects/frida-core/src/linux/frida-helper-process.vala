@@ -642,13 +642,13 @@ namespace Frida {
 			this.tempdir = tempdir;
 
 #if HAVE_EMBEDDED_ASSETS
-			var blob32 = Frida.Data.Helper.get_frida_helper_32_blob ();
+			var blob32 = Frida.Data.Helper.get_xiam_helper_32_blob ();
 			if (blob32.data.length > 0)
-				helper32 = make_temporary_helper ("frida-helper-32", blob32.data);
+				helper32 = make_temporary_helper ("xiam-helper-32", blob32.data);
 
-			var blob64 = Frida.Data.Helper.get_frida_helper_64_blob ();
+			var blob64 = Frida.Data.Helper.get_xiam_helper_64_blob ();
 			if (blob64.data.length > 0)
-				helper64 = make_temporary_helper ("frida-helper-64", blob64.data);
+				helper64 = make_temporary_helper ("xiam-helper-64", blob64.data);
 #else
 			var tpl = PathTemplate (Config.FRIDA_HELPER_PATH);
 			string path = tpl.expand ((sizeof (void *) == 8) ? "32" : "64");

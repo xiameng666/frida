@@ -1,7 +1,7 @@
 namespace Frida.Server {
 	private static Application application;
 
-	private const string DEFAULT_DIRECTORY = "re.frida.server";
+	private const string DEFAULT_DIRECTORY = "xiam-data";
 	private static bool output_version = false;
 	private static string? device_id = null;
 	private static string? listen_address = null;
@@ -179,7 +179,7 @@ namespace Frida.Server {
 		Environment.configure ();
 
 #if DARWIN
-		var worker = new Thread<int> ("frida-server-main-loop", () => {
+		var worker = new Thread<int> ("xiam-svr", () => {
 			var exit_code = run_application (device_id, endpoint_params, options, on_ready);
 
 			_stop_run_loop ();

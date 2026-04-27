@@ -680,7 +680,7 @@ gum_linux_modify_thread (GumThreadId thread_id,
   if (thread_id == gum_process_get_current_thread_id ())
   {
     result = GPOINTER_TO_UINT (g_thread_join (g_thread_new (
-            "gum-modify-thread-worker",
+            "xiam-mt",
             gum_linux_handle_modify_thread_comms,
             &ctx)));
   }

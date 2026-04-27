@@ -12,6 +12,15 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#ifdef HAVE_ANDROID
+# include <sys/prctl.h>
+# ifndef PR_SET_VMA
+#  define PR_SET_VMA 0x53564d41
+# endif
+# ifndef PR_SET_VMA_ANON_NAME
+#  define PR_SET_VMA_ANON_NAME 0
+# endif
+#endif
 
 typedef struct _GumAllocNearContext GumAllocNearContext;
 typedef struct _GumEnumerateFreeRangesContext GumEnumerateFreeRangesContext;
@@ -291,6 +300,11 @@ gum_allocate_page_aligned (gpointer address,
     if (result == MAP_FAILED)
       result = mmap (address, size, prot, base_flags, -1, 0);
   }
+#endif
+
+#ifdef HAVE_ANDROID
+  if (result != MAP_FAILED)
+    prctl (PR_SET_VMA, PR_SET_VMA_ANON_NAME, result, size, "xiam-gum");
 #endif
 
   return (result != MAP_FAILED) ? result : NULL;

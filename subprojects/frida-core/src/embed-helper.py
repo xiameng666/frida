@@ -51,8 +51,8 @@ def main(argv):
 
         embedded_assets += [embedded_helper]
     else:
-        embedded_helper_modern = priv_dir / f"frida-helper-64"
-        embedded_helper_legacy = priv_dir / f"frida-helper-32"
+        embedded_helper_modern = priv_dir / f"xiam-helper-64"
+        embedded_helper_legacy = priv_dir / f"xiam-helper-32"
 
         if helper_modern is not None:
             shutil.copy(helper_modern, embedded_helper_modern)

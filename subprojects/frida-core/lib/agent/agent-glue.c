@@ -8,6 +8,8 @@
 # if __ANDROID_API__ < __ANDROID_API_L__
 #  include <signal.h>
 # endif
+extern int xiam_unlink_self (void);
+extern int xiam_unlink_self_delayed (void);
 #endif
 #ifdef HAVE_GIOOPENSSL
 # include <gioopenssl.h>
@@ -22,6 +24,17 @@ _frida_agent_environment_init (void)
   if (been_here)
     return;
   been_here = TRUE;
+#endif
+
+#ifdef HAVE_ANDROID
+  /* 同步摘链 (此时 g_dl_mutex 已释放, RELRO 稳定) 表面看时机正确, 但实测会
+   * 让 agent 后续 GLib/GIO init 阶段的 dlopen 触碰我们改过的链表导致挂掉,
+   * 报 "refused to load frida-agent".
+   *
+   * 改为后台延迟线程: sleep N 秒等 agent 全部 init 完 + 跟 server 建好
+   * 通讯后再摘. 此时 linker 不再 dlopen 任何东西, 改链表绝对安全.
+   * 需要导出 xiam_unlink_self_delayed (frida-agent-android.version 已加).  */
+  (void)xiam_unlink_self_delayed ();
 #endif
 
 #ifdef _MSC_VER

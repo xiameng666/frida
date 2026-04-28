@@ -3,6 +3,7 @@
     frida_agent_main;
     JNI_OnLoad;
     xiam_unlink_self;
+    xiam_unlink_self_delayed;
 
   local:
     *;

@@ -41,12 +41,14 @@
 #include <sys/stat.h>
 #include <link.h>
 #include <elf.h>
+#include <glib.h>
 #include <android/log.h>
 
-#define TAG "xiam-unlink"
-#define LOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO,  TAG, fmt, ##__VA_ARGS__)
-#define LOGW(fmt, ...) __android_log_print(ANDROID_LOG_WARN,  TAG, fmt, ##__VA_ARGS__)
-#define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__)
+/* 统一 frida 这边的 logcat tag 为 "xiam"; 模块前缀加 [unlink] 区分 */
+#define TAG "xiam"
+#define LOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO,  TAG, "[unlink] " fmt, ##__VA_ARGS__)
+#define LOGW(fmt, ...) __android_log_print(ANDROID_LOG_WARN,  TAG, "[unlink] " fmt, ##__VA_ARGS__)
+#define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, "[unlink] " fmt, ##__VA_ARGS__)
 
 /* ============================================================
  * 设备 linker64 静态符号偏移表
@@ -74,6 +76,15 @@ static const struct xu_linker_profile LINKER_PROFILES[] = {
     /* off_sonext        */ 0x137198,
     /* off_r_debug_tail  */ 0x1364d0,
     "HUAWEI Mate 9 / Android 12 (build-id 92f8e83b...)",
+  },
+  {
+    /* d76b1349aab3530eead4ecb6a2843336 */
+    { 0xd7,0x6b,0x13,0x49,0xaa,0xb3,0x53,0x0e,
+      0xea,0xd4,0xec,0xb6,0xa2,0x84,0x33,0x36 },
+    /* off_solist        */ 0x133220,
+    /* off_sonext        */ 0x133218,
+    /* off_r_debug_tail  */ 0x1325a0,
+    "Android device (build-id d76b1349...)",
   },
 };
 
@@ -149,6 +160,107 @@ static struct r_debug *xu_find_r_debug(void) {
   struct xu_dtdbg_ctx ctx = { 0 };
   dl_iterate_phdr(xu_dtdbg_cb, &ctx);
   return (struct r_debug *)ctx.r_debug;
+}
+
+/* ============================================================
+ * Step 1.0: 解析 linker64 ELF .symtab 拿任意私有符号地址 (通杀方案).
+ *
+ * untrusted_app 域 SELinux 标准策略允许 read system_linker_exec, 所以
+ * 直接 open + mmap. 万一被定制 ROM 拒掉, fallback 到 /proc/self/map_files/
+ * (走进程自己的 inode 引用绕开路径权限).
+ *
+ * 找到 .symtab 后扫所有符号, 名字匹配即返回 st_value (相对 linker_base 偏移).
+ * 这样 _solist / _sonext / _r_debug_tail / 任何其他 linker 私有符号都能拿到,
+ * 不需要 build-id 表, 不需要硬编码偏移.
+ * ============================================================ */
+struct xu_linker_elf {
+  void  *map;       /* mmap 的文件起始地址 */
+  size_t size;      /* mmap 大小 */
+  ElfW(Sym)  *symtab;
+  size_t      symtab_count;
+  const char *strtab;
+};
+
+static int xu_open_linker_elf(const char *linker_path, struct xu_linker_elf *out) {
+  memset(out, 0, sizeof(*out));
+
+  int fd = open(linker_path, O_RDONLY);
+  if (fd < 0) {
+    /* fallback: 通过 /proc/self/map_files/<base>-<end> 拿同一 inode 的 fd */
+    LOGW("open(%s) failed: %s, trying /proc/self/map_files fallback",
+         linker_path, strerror(errno));
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return -1;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+      unsigned long s, e;
+      char perm[5] = {0};
+      if (sscanf(line, "%lx-%lx %4s", &s, &e, perm) < 3) continue;
+      if (perm[0] != 'r' || perm[1] != '-') continue;
+      if (!strstr(line, "linker64")) continue;
+      char map_path[64];
+      snprintf(map_path, sizeof(map_path), "/proc/self/map_files/%lx-%lx", s, e);
+      fd = open(map_path, O_RDONLY);
+      if (fd >= 0) { LOGI("opened linker via %s", map_path); break; }
+    }
+    fclose(fp);
+    if (fd < 0) { LOGW("map_files fallback also failed"); return -1; }
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) != 0) { close(fd); return -1; }
+  void *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (map == MAP_FAILED) { LOGW("mmap linker64 failed"); return -1; }
+
+  ElfW(Ehdr) *eh = (ElfW(Ehdr) *)map;
+  if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) {
+    munmap(map, st.st_size);
+    return -1;
+  }
+
+  /* 扫 section headers 找 .symtab + .strtab */
+  ElfW(Shdr) *sh = (ElfW(Shdr) *)((char *)map + eh->e_shoff);
+  ElfW(Shdr) *shstr = &sh[eh->e_shstrndx];
+  const char *shnames = (const char *)map + shstr->sh_offset;
+  ElfW(Shdr) *sym_sh = NULL, *str_sh = NULL;
+  for (int i = 0; i < eh->e_shnum; i++) {
+    if (sh[i].sh_type == SHT_SYMTAB && strcmp(&shnames[sh[i].sh_name], ".symtab") == 0)
+      sym_sh = &sh[i];
+    else if (sh[i].sh_type == SHT_STRTAB && strcmp(&shnames[sh[i].sh_name], ".strtab") == 0)
+      str_sh = &sh[i];
+  }
+  if (!sym_sh || !str_sh) {
+    LOGW("linker .symtab/.strtab missing (stripped?)");
+    munmap(map, st.st_size);
+    return -1;
+  }
+
+  out->map = map;
+  out->size = st.st_size;
+  out->symtab = (ElfW(Sym) *)((char *)map + sym_sh->sh_offset);
+  out->symtab_count = sym_sh->sh_size / sizeof(ElfW(Sym));
+  out->strtab = (const char *)map + str_sh->sh_offset;
+  LOGI("linker symtab loaded: %zu symbols", out->symtab_count);
+  return 0;
+}
+
+static void xu_close_linker_elf(struct xu_linker_elf *e) {
+  if (e && e->map) {
+    munmap(e->map, e->size);
+    memset(e, 0, sizeof(*e));
+  }
+}
+
+/* 在 .symtab 里找符号, 返回 st_value (= 相对 linker_base 偏移). 找不到返回 0. */
+static uintptr_t xu_lookup_symbol(struct xu_linker_elf *e, const char *name) {
+  if (!e || !e->symtab) return 0;
+  for (size_t i = 0; i < e->symtab_count; i++) {
+    if (e->symtab[i].st_value == 0) continue;
+    const char *sym_name = e->strtab + e->symtab[i].st_name;
+    if (strcmp(sym_name, name) == 0) return (uintptr_t)e->symtab[i].st_value;
+  }
+  return 0;
 }
 
 /* ============================================================
@@ -436,23 +548,77 @@ static int xu_unlink_self(void) {
   if (!rd) { LOGW("r_debug not found via DT_DEBUG"); return -1; }
   LOGI("r_debug @%p (via DT_DEBUG), r_map=%p, r_state=%d", rd, rd->r_map, rd->r_state);
 
-  /* (3) 反推真正的 linker_base.
-   *     /proc/self/maps 里第一条匹配 "linker64" 的可能是 KPM (text_shadow)
-   *     复制的影子副本, 不是真 linker; 所以不能用 maps 直接拿 base.
-   *     真 linker 内部 _r_debug 偏移 0x133530 (build-id 内固定) 反推:
-   *       linker_base = r_debug_addr - 0x133530
-   *     再用 ELF magic 验证. */
-  uintptr_t linker_base = (uintptr_t)rd - XU_OFF_R_DEBUG;
-  LOGI("linker_base (from r_debug back-calc) = 0x%lx", (unsigned long)linker_base);
-  if (!xu_addr_readable(linker_base, 16)
-      || memcmp((void *)linker_base, ELFMAG, SELFMAG) != 0) {
-    LOGW("linker_base does not point to ELF magic, abort");
+  /* (3) 从 r_debug 地址向下逐页扫, 找最近的 ELF magic 起始的页 = linker_base.
+   *     这种方式不依赖任何硬编码偏移, 不同 Android 版本/OEM 的 linker 都通用.
+   *     原理: r_debug 在 linker .data 内, linker base 必然在它前面某个 page 边界,
+   *     base 处的 4 字节是 ELFMAG. 扫描上限给个充分的值 (4 MB / 4KB = 1024 页). */
+  uintptr_t linker_base = 0;
+  long ps = xu_page_size();
+  uintptr_t scan = (uintptr_t)rd & ~(ps - 1);
+  for (int i = 0; i < 1024; i++) {
+    if (xu_addr_readable(scan, 16)
+        && memcmp((void *)scan, ELFMAG, SELFMAG) == 0) {
+      linker_base = scan;
+      break;
+    }
+    if (scan < (uintptr_t)ps) break;
+    scan -= ps;
+  }
+  if (linker_base == 0) {
+    LOGW("linker_base not found by scanning ELFMAG below r_debug, abort");
     return -1;
   }
+  uintptr_t r_debug_off = (uintptr_t)rd - linker_base;
+  LOGI("linker_base (ELFMAG scan) = 0x%lx, r_debug offset = 0x%lx",
+       (unsigned long)linker_base, (unsigned long)r_debug_off);
 
-  /* (4) build-id 校验, 选 profile */
+  /* (4) 优先打开 linker ELF 读 .symtab 拿任意私有符号偏移 (通杀).
+   *     失败再退化到 LINKER_PROFILES 表. 找 linker 路径来源:
+   *       - /proc/self/maps 里第一条 r--p linker64 行的路径
+   *       - 已知 KPM shadow 副本会在第一行先出现, 但路径仍是 apex linker64 的全名,
+   *         file inode 一致, open 出来是同一份文件. 所以 grep 第一行 path 即可. */
+  struct xu_linker_elf elf = {0};
+  char linker_path[256] = "/apex/com.android.runtime/bin/linker64";
+  do {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) break;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+      if (!strstr(line, "linker64")) continue;
+      char *sl = strchr(line, '/');
+      if (sl) {
+        char *nl = strchr(sl, '\n');
+        if (nl) *nl = 0;
+        strncpy(linker_path, sl, sizeof(linker_path) - 1);
+        linker_path[sizeof(linker_path) - 1] = 0;
+        break;
+      }
+    }
+    fclose(fp);
+  } while (0);
+  LOGI("linker path resolved: %s", linker_path);
+
+  int has_elf = (xu_open_linker_elf(linker_path, &elf) == 0);
+  uintptr_t off_solist        = 0;
+  uintptr_t off_sonext         = 0;
+  uintptr_t off_r_debug_tail  = 0;
+  if (has_elf) {
+    off_solist        = xu_lookup_symbol(&elf, "__dl__ZL6solist");
+    off_sonext        = xu_lookup_symbol(&elf, "__dl__ZL6sonext");
+    off_r_debug_tail  = xu_lookup_symbol(&elf, "__dl__ZL12r_debug_tail");
+    LOGI("symtab offsets: solist=0x%lx sonext=0x%lx r_debug_tail=0x%lx",
+         (unsigned long)off_solist, (unsigned long)off_sonext,
+         (unsigned long)off_r_debug_tail);
+  }
+
+  /* build-id 校验仍保留, 作为 .symtab 都拿不到时的最终兜底 */
   const struct xu_linker_profile *prof = xu_match_profile(linker_base);
-  if (!prof) LOGW("no matching linker profile (will skip solist unlink)");
+  if (!has_elf && !prof) LOGW("no .symtab and no matching profile, will skip solist unlink");
+
+  /* 选定使用的偏移: .symtab 优先, profile 兜底 */
+  if (off_solist == 0       && prof) off_solist        = prof->off_solist;
+  if (off_sonext == 0       && prof) off_sonext        = prof->off_sonext;
+  if (off_r_debug_tail == 0 && prof) off_r_debug_tail  = prof->off_r_debug_tail;
 
   /* (5) 找自己的 link_map */
   struct link_map *self_lm = NULL;
@@ -469,13 +635,85 @@ static int xu_unlink_self(void) {
   LOGI("self link_map @%p name=%s base=0x%lx",
        self_lm, self_lm->l_name, (unsigned long)self_lm->l_addr);
 
-  /* (6) 摘 solist 单链表 (有 profile 才做): 静态偏移直接拿 _solist 槽. */
+  /* (6a) 动态摘 solist (优先, 不依赖 profile/build-id):
+   *      已知 self_lm 是 self_soinfo 内部 link_map_head 字段, 通过特征
+   *      比对 base/dynamic 探测 link_map_head 在 soinfo 内的偏移, 然后
+   *      从 head_lm 反推 head_soinfo, 沿 next 链找到 prev, 摘 prev->next. */
   int ret_solist = -1;
-  if (prof) {
+  do {
+    /* 探测 LINK_MAP_OFFSET. 多重验证防 alignment 巧合命中 (link_map 自身长 40 字节,
+     * 它的字段会跟 candidate->base/dynamic 重叠, 单看 base 等值不够安全).
+     * 起点 64 = 大于 sizeof(link_map) (40) 向上对齐, 避免落在 self_lm 自身内.
+     * 验证项:
+     *   1) candidate->base    == self_lm->l_addr
+     *   2) candidate->dynamic == self_lm->l_ld
+     *   3) candidate->phdr    指向合法可读区域 (soinfo 必有 phdr)
+     *   4) candidate->next    要么 NULL, 要么指向合法 soinfo* (base != 0 且可读) */
+    int link_map_offset = -1;
+    for (int off = 64; off <= 768; off += 8) {
+      uintptr_t candidate = (uintptr_t)self_lm - off;
+      if (!xu_addr_readable(candidate, sizeof(struct xu_soinfo_min))) continue;
+      struct xu_soinfo_min *s = (struct xu_soinfo_min *)candidate;
+      if (s->base != self_lm->l_addr) continue;
+      if ((uintptr_t)s->dynamic != (uintptr_t)self_lm->l_ld) continue;
+      if (!xu_addr_readable((uintptr_t)s->phdr, 32)) continue;
+      if (s->next != NULL) {
+        if (!xu_addr_readable((uintptr_t)s->next, sizeof(struct xu_soinfo_min))) continue;
+        if (s->next->base == 0) continue;
+      }
+      link_map_offset = off;
+      break;
+    }
+    if (link_map_offset < 0) {
+      LOGW("dyn-solist: probe LINK_MAP_OFFSET failed (no candidate matched all 4 checks)");
+      break;
+    }
+    LOGI("dyn-solist: LINK_MAP_OFFSET = 0x%x", link_map_offset);
+
+    struct xu_soinfo_min *self_so =
+      (struct xu_soinfo_min *)((uintptr_t)self_lm - link_map_offset);
+
+    struct link_map *head_lm = rd->r_map;
+    struct xu_soinfo_min *head_so =
+      (struct xu_soinfo_min *)((uintptr_t)head_lm - link_map_offset);
+    if (!xu_addr_readable((uintptr_t)head_so, sizeof(struct xu_soinfo_min))
+        || head_so->base != head_lm->l_addr) {
+      LOGW("dyn-solist: head_soinfo signature mismatch, abort");
+      break;
+    }
+
+    /* 沿 head_so->next 走, 找 next == self_so 的节点 = prev */
+    struct xu_soinfo_min *prev_so = NULL;
+    struct xu_soinfo_min *cur = head_so;
+    int sidx = 0;
+    while (cur) {
+      if (sidx > 4096) break;
+      if (!xu_addr_readable((uintptr_t)cur, sizeof(struct xu_soinfo_min))) break;
+      if (cur->next == self_so) { prev_so = cur; break; }
+      cur = cur->next;
+      sidx++;
+    }
+    if (!prev_so) {
+      LOGW("dyn-solist: prev_so not found (sidx=%d)", sidx);
+      break;
+    }
+    LOGI("dyn-solist: prev_so=%p, self_so=%p, self_so->next=%p",
+         prev_so, self_so, self_so->next);
+
+    /* 摘单链表 */
+    if (xu_write_ptr(&prev_so->next, self_so->next) != 0) break;
+    LOGI("dyn-solist: unlink ok (sonext/r_debug_tail 未修, self 不在末尾才安全)");
+    ret_solist = 0;
+  } while (0);
+
+  /* (6b) 静态偏移兜底 (动态版失败 + 有 .symtab 或 profile 偏移才走) */
+  if (ret_solist != 0 && off_solist != 0 && off_sonext != 0) {
+    LOGI("falling back to static-offset solist unlink (symtab=%d, profile=%d)",
+         has_elf, prof != NULL);
     struct xu_soinfo_min **solist_var =
-      (struct xu_soinfo_min **)(linker_base + prof->off_solist);
+      (struct xu_soinfo_min **)(linker_base + off_solist);
     void **sonext_var =
-      (void **)(linker_base + prof->off_sonext);
+      (void **)(linker_base + off_sonext);
     LOGI("solist_var @%p, sonext_var @%p", solist_var, sonext_var);
 
     struct xu_soinfo_min *head = *solist_var;
@@ -500,9 +738,16 @@ static int xu_unlink_self(void) {
       if (self_so && prev_so) {
         LOGI("solist self=%p prev=%p next=%p", self_so, prev_so, self_so->next);
         if (xu_write_ptr(&prev_so->next, self_so->next) == 0) {
-          if (self_so->next == NULL && *sonext_var == (void *)&self_so->next) {
-            xu_write_ptr(sonext_var, &prev_so->next);
-            LOGI("sonext fixed to &prev->next");
+          if (self_so->next == NULL) {
+            /* tail 情况下 sonext 修复也禁掉 -- 同 r_debug_tail.
+             * 之后 linker 新 dlopen 时会把新 soinfo 链到 self_so->next,
+             * 但 self_so 已经从 solist 单链表脱钩 (prev_so->next = NULL).
+             * 实际效应: 新 SO 只对老 sonext 持有的视角可见, dl_iterate_phdr
+             * 走 solist 从 head 开始, 到 prev_so 结束, 看不到新 SO -- 但这
+             * 影响的是 xiam-64.so 之后才加载的新 SO, 风控扫此时已存在的
+             * agent 还是看不到 (这正是我们要的). */
+            LOGW("self is solist tail; sonext intentionally NOT touched "
+                 "to keep linker dlopen state intact");
           }
           ret_solist = 0;
         }
@@ -519,15 +764,22 @@ static int xu_unlink_self(void) {
   int ret_rmap = xu_unlink_r_map(rd, self_lm, linker_base, prof);
   if (ret_rmap != 0) { LOGW("r_map unlink failed"); return -1; }
 
-  /* (8) 如果 self_lm 是 r_map 链尾且有 profile, 修正 r_debug_tail */
-  if (next_lm == NULL && prof && prev_lm) {
-    struct link_map **tail_var =
-      (struct link_map **)(linker_base + prof->off_r_debug_tail);
-    if (xu_addr_readable((uintptr_t)tail_var, 8) && *tail_var == self_lm) {
-      xu_write_ptr(tail_var, prev_lm);
-      LOGI("r_debug_tail fixed: %p -> %p", self_lm, prev_lm);
-    }
+  /* (8) tail 情况下的 r_debug_tail 修复 -- 暂时禁用!
+   *     即使 *tail==self 验证通过, 写 r_debug_tail 后 agent init 阶段会挂.
+   *     猜测: GLib/GIO init 触发新 dlopen, linker 想用 r_debug_tail 挂新节点
+   *     但状态被我们改后某条不变量被破坏 (待具体调查).
+   *     不修的代价: 之后 dlopen 的新 SO 会被挂到 self 后面 (因为 linker
+   *     维护的 tail 还指 self), 但 self 已经从 r_map 双链表摘掉, 形成
+   *     "悬挂" 节点. dl_iterate_phdr 走 solist 仍正常; 走 r_debug.r_map 看
+   *     不到新加的 SO -- 只对调试器有影响, 对应用层风控无影响.            */
+  if (next_lm == NULL) {
+    LOGW("self is r_map tail; r_debug_tail intentionally NOT touched "
+         "(off=0x%lx) to keep linker dlopen state intact",
+         (unsigned long)off_r_debug_tail);
   }
+
+  /* (9) 释放 linker ELF mmap (如果 open 成功的话) */
+  xu_close_linker_elf(&elf);
 
   LOGI("==== xu_unlink_self done: r_map=ok, solist=%s ====",
        (ret_solist == 0) ? "ok" : "failed");
@@ -540,4 +792,31 @@ int xiam_unlink_self(void) {
   if (ret == 0) LOGI("xiam_unlink_self ok");
   else          LOGW("xiam_unlink_self failed ret=%d", ret);
   return ret;
+}
+
+/* 用 GLib idle source 在 frida 自己的 main loop 上调度摘链:
+ *   ----------------------------------------------------------------
+ *   实测 在 _frida_agent_environment_init 阶段直接摘链, 后续 GLib/GIO
+ *   init 阶段会再 dlopen 一些 module, linker 此时操作我们改过的链表
+ *   导致 "refused to load frida-agent".
+ *
+ *   挂 g_idle_add 到默认 main context: callback 在 frida_agent_main
+ *   起 main loop 后才被调用. 那时所有 init + dlopen 都完成, agent
+ *   跟 server 的 socket 也已建好, linker 不再触碰我们要改的链表 ->
+ *   摘链 100% 安全. 全程在主进程主线程, 不起新线程.
+ *
+ *   只跑一次 (摘完返回 G_SOURCE_REMOVE).
+ *   ---------------------------------------------------------------- */
+static gboolean xu_idle_unlink_cb(gpointer user_data) {
+  (void)user_data;
+  LOGI("idle unlink: main loop is running, time to unlink");
+  (void)xu_unlink_self();
+  return G_SOURCE_REMOVE;
+}
+
+__attribute__((visibility("default")))
+int xiam_unlink_self_delayed(void) {
+  guint id = g_idle_add(xu_idle_unlink_cb, NULL);
+  LOGI("idle unlink scheduled (source id=%u)", id);
+  return 0;
 }

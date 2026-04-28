@@ -22,6 +22,9 @@
 
 #ifdef HAVE_ANDROID
 # include "gum/gumandroid.h"
+# include <link.h>
+# include <elf.h>
+# include <android/log.h>
 #endif
 #ifndef GUM_USE_SYSTEM_ALLOC
 # ifdef HAVE_DARWIN
@@ -331,6 +334,90 @@ gum_apply_patch_code (gpointer mem,
   context->func ((guint8 *) mem + context->page_offset, context->user_data);
 }
 
+#ifdef HAVE_ANDROID
+/* 查找 addr 所在的 PT_LOAD+PF_X 段, 同时记录该段的原始 ELF perm.
+ * 用 dl_iterate_phdr (公开 API, 不依赖 /proc/self/maps).
+ *
+ * patch_code_pages 流程:
+ *   1) 整段 mprotect RWX (保留 X, 别的线程在该段执行不会因 NX 崩)
+ *   2) 写跳板
+ *   3) 整段 mprotect 还原成 phdr 推算的原始 perm (一般 RX)
+ *
+ * 整段同时改 perm, vma 内所有 page anon_vma 状态一致, vma_merge
+ * 还原后回到原始一段, 不撕段. */
+typedef struct _GumTextSegment {
+  guint8 *           start;       /* 页对齐起始 */
+  guint8 *           end;         /* 页对齐结束 (不含) */
+  GumPageProtection  orig_prot;   /* ELF p_flags 推算的原始 perm */
+} GumTextSegment;
+
+typedef struct _GumFindTextCtx {
+  uintptr_t       target;
+  GumTextSegment  out;
+  gboolean        found;
+} GumFindTextCtx;
+
+static int
+gum_find_text_phdr_cb (struct dl_phdr_info * info,
+                       size_t size,
+                       void * data)
+{
+  GumFindTextCtx * ctx = data;
+  int i;
+
+  if (ctx->found)
+    return 1;
+  if (info->dlpi_phdr == NULL || info->dlpi_phnum == 0)
+    return 0;
+
+  for (i = 0; i < info->dlpi_phnum; i++)
+  {
+    const ElfW (Phdr) * ph = &info->dlpi_phdr[i];
+    uintptr_t s, e;
+    gsize ps = gum_query_page_size ();
+
+    if (ph->p_type != PT_LOAD) continue;
+    if ((ph->p_flags & PF_X) == 0) continue;
+
+    s = (uintptr_t) info->dlpi_addr + ph->p_vaddr;
+    e = s + ph->p_memsz;
+
+    if (ctx->target < s || ctx->target >= e) continue;
+
+    /* 页对齐 */
+    ctx->out.start = (guint8 *) (s & ~(ps - 1));
+    ctx->out.end = (guint8 *) ((e + ps - 1) & ~(ps - 1));
+
+    /* ELF p_flags -> GumPageProtection */
+    ctx->out.orig_prot = 0;
+    if (ph->p_flags & PF_R) ctx->out.orig_prot |= GUM_PAGE_READ;
+    if (ph->p_flags & PF_W) ctx->out.orig_prot |= GUM_PAGE_WRITE;
+    if (ph->p_flags & PF_X) ctx->out.orig_prot |= GUM_PAGE_EXECUTE;
+
+    ctx->found = TRUE;
+    return 1;
+  }
+  return 0;
+}
+
+static gboolean
+gum_find_text_segment (gpointer addr, GumTextSegment * out)
+{
+  GumFindTextCtx ctx = { (uintptr_t) addr, { 0, 0, 0 }, FALSE };
+  dl_iterate_phdr (gum_find_text_phdr_cb, &ctx);
+  if (!ctx.found)
+    return FALSE;
+  *out = ctx.out;
+  return TRUE;
+}
+
+static gboolean
+gum_text_segment_contains (const GumTextSegment * seg, gpointer p)
+{
+  return (guint8 *) p >= seg->start && (guint8 *) p < seg->end;
+}
+#endif
+
 gboolean
 gum_memory_patch_code_pages (GPtrArray * sorted_addresses,
                              gboolean coalesce,
@@ -494,6 +581,13 @@ cleanup:
   {
     GumPageProtection protection;
     GumSuspendOperation suspend_op = { 0, };
+#ifdef HAVE_ANDROID
+    /* file-backed 走整段 mprotect (RWX, 保留 X 让别的线程不崩); 写完按 phdr
+     * 原始 perm (一般 RX) 整段还原.
+     * anon page (gum trampoline 池等) 走 per-page mprotect. */
+    GArray * segs = g_array_new (FALSE, FALSE, sizeof (GumTextSegment));
+    gboolean has_anon_pages = FALSE;
+#endif
 
     protection = rwx_supported ? GUM_PAGE_RWX : GUM_PAGE_RW;
 
@@ -507,6 +601,67 @@ cleanup:
           GUM_THREAD_FLAGS_NONE);
     }
 
+#ifdef HAVE_ANDROID
+    /* 收集涉及的 PT_LOAD+PF_X 段, 去重. anon page 标 has_anon_pages. */
+    for (i = 0; i != sorted_addresses->len; i++)
+    {
+      gpointer page = g_ptr_array_index (sorted_addresses, i);
+      GumTextSegment seg;
+      gboolean dup = FALSE;
+      guint k;
+      for (k = 0; k < segs->len; k++)
+      {
+        GumTextSegment * prev = &g_array_index (segs, GumTextSegment, k);
+        if (gum_text_segment_contains (prev, page)) { dup = TRUE; break; }
+      }
+      if (dup) continue;
+      if (!gum_find_text_segment (page, &seg))
+      {
+        has_anon_pages = TRUE;
+        continue;
+      }
+      g_array_append_val (segs, seg);
+    }
+
+    /* file-backed 段: 整段 mprotect RWX (保留 X, 别的线程在该段执行不崩) */
+    for (i = 0; i != segs->len; i++)
+    {
+      GumTextSegment * s = &g_array_index (segs, GumTextSegment, i);
+      if (!gum_try_mprotect (s->start, s->end - s->start, GUM_PAGE_RWX))
+      {
+        __android_log_print (ANDROID_LOG_ERROR, "xiam",
+            "[gum-patch] mprotect RWX seg FAILED [%p, %p)", s->start, s->end);
+        result = FALSE;
+        goto resume_threads;
+      }
+    }
+
+    /* anon page: per-page mprotect (跟 frida 原 path 一致) */
+    if (has_anon_pages)
+    {
+      for (i = 0; i != sorted_addresses->len; i++)
+      {
+        gpointer page = g_ptr_array_index (sorted_addresses, i);
+        gboolean handled_by_seg = FALSE;
+        guint k;
+        for (k = 0; k < segs->len; k++)
+        {
+          GumTextSegment * prev = &g_array_index (segs, GumTextSegment, k);
+          if (gum_text_segment_contains (prev, page)) { handled_by_seg = TRUE; break; }
+        }
+        if (handled_by_seg) continue;
+        if (!gum_try_mprotect (page, page_size, GUM_PAGE_RWX))
+        {
+          __android_log_print (ANDROID_LOG_ERROR, "xiam",
+              "[gum-patch] mprotect RWX anon FAILED page=%p", page);
+          result = FALSE;
+          goto resume_threads;
+        }
+      }
+    }
+    goto skip_per_page_protect;
+#endif
+
     for (i = 0; i != sorted_addresses->len; i++)
     {
       gpointer target_page = g_ptr_array_index (sorted_addresses, i);
@@ -517,6 +672,10 @@ cleanup:
         goto resume_threads;
       }
     }
+#ifdef HAVE_ANDROID
+skip_per_page_protect:
+#endif
+    ;
 
     apply_start = NULL;
     apply_num_pages = 0;
@@ -556,6 +715,46 @@ cleanup:
     if (apply_num_pages != 0)
       apply (apply_start, apply_target_start, apply_num_pages, apply_data);
 
+#ifdef HAVE_ANDROID
+    /* Android 还原 perm:
+     *   file-backed 段: 整段 mprotect 还原成 phdr 推算的原始 perm
+     *     (PT_LOAD+PF_X 段一般 RX). 整段始终 1 个 vma 不撕.
+     *   anon page: per-page mprotect RX 还原. */
+    for (i = 0; i != segs->len; i++)
+    {
+      GumTextSegment * s = &g_array_index (segs, GumTextSegment, i);
+      if (!gum_try_mprotect (s->start, s->end - s->start, s->orig_prot))
+      {
+        __android_log_print (ANDROID_LOG_ERROR, "xiam",
+            "[gum-patch] mprotect restore seg FAILED [%p, %p) prot=0x%x",
+            s->start, s->end, s->orig_prot);
+        result = FALSE;
+        goto resume_threads;
+      }
+    }
+    if (has_anon_pages)
+    {
+      for (i = 0; i != sorted_addresses->len; i++)
+      {
+        gpointer page = g_ptr_array_index (sorted_addresses, i);
+        gboolean handled_by_seg = FALSE;
+        guint k;
+        for (k = 0; k < segs->len; k++)
+        {
+          GumTextSegment * prev = &g_array_index (segs, GumTextSegment, k);
+          if (gum_text_segment_contains (prev, page)) { handled_by_seg = TRUE; break; }
+        }
+        if (handled_by_seg) continue;
+        if (!gum_try_mprotect (page, page_size, GUM_PAGE_RX))
+        {
+          __android_log_print (ANDROID_LOG_ERROR, "xiam",
+              "[gum-patch] mprotect restore anon FAILED page=%p", page);
+          result = FALSE;
+          goto resume_threads;
+        }
+      }
+    }
+#else
     if (!rwx_supported)
     {
       /*
@@ -576,6 +775,7 @@ cleanup:
         }
       }
     }
+#endif
 
     for (i = 0; i != sorted_addresses->len; i++)
     {
@@ -585,6 +785,10 @@ cleanup:
     }
 
 resume_threads:
+#ifdef HAVE_ANDROID
+    if (segs != NULL)
+      g_array_unref (segs);
+#endif
     if (!rwx_supported)
     {
       guint num_suspended, i;
@@ -1263,7 +1467,11 @@ gum_ensure_code_readable (gconstpointer address,
   {
     if (!g_hash_table_contains (gum_softened_code_pages, cur_page))
     {
-      if (gum_try_mprotect ((gpointer) cur_page, page_size, GUM_PAGE_RWX))
+      /* 原版用 GUM_PAGE_RWX (永久 W+X), 这是 maps 上 libc/libart 出现 rwxp
+       * 段的根源. ensure_code_readable 真正需要的只是 R+X (确保 frida 自己
+       * 能读这些 .text 页, 应对 bionic GWP-ASan 等机制).
+       * 不需要 W, 因为后续真要写跳板时 patch_code 自己会 mprotect RWX. */
+      if (gum_try_mprotect ((gpointer) cur_page, page_size, GUM_PAGE_RX))
         g_hash_table_add (gum_softened_code_pages, (gpointer) cur_page);
     }
   }

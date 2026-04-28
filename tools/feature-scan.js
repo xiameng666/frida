@@ -906,6 +906,134 @@ function unlinkSelf() {
   return ret;
 }
 
+// ---------------- 经典 hook 隐藏方案验证 ----------------
+// 思路: hook 前记录 range, mprotect rwx, attach, flush, mprotect r-x.
+// 比对 hook 前/后的 /proc/self/maps, 看 libc 段是否撕成多片 / 是否出现 rwxp.
+//
+// 用法:
+//   testHookHide('open')                 // 默认 hook libc 的 open
+//   testHookHide('libc.so', 'fopen')     // 指定 module + symbol
+//   testHookHide('libc.so', null, 0x1000) // 直接 hook 偏移
+function testHookHide(arg1, arg2, arg3) {
+  let modName, symName, off;
+  if (typeof arg1 === 'string' && arg2 === undefined) {
+    modName = 'libc.so'; symName = arg1; off = null;
+  } else if (typeof arg2 === 'string') {
+    modName = arg1; symName = arg2; off = null;
+  } else {
+    modName = arg1; symName = null; off = arg3;
+  }
+
+  console.log(`\n========== testHookHide(${modName}, ${symName}, ${off}) ==========`);
+
+  let target;
+  let mod;
+  try { mod = Process.getModuleByName(modName); }
+  catch (e) { console.log(`[err] module ${modName} not found`); return; }
+
+  if (symName) {
+    target = mod.findExportByName(symName);
+    if (!target) {
+      console.log(`[err] symbol ${symName} not found in ${modName}`);
+      return;
+    }
+  } else if (off !== null && off !== undefined) {
+    target = mod.base.add(off);
+  } else {
+    console.log('[err] need symName or off');
+    return;
+  }
+  console.log(`[hook] target = ${target}  (${modName}!${symName || 'off=' + off})`);
+
+  // ---- 步骤 1: hook 前快照 ----
+  function snapshotMapsForModule(name) {
+    const txt = readAll('/proc/self/maps');
+    return txt.split('\n').filter(l => l.includes(name));
+  }
+  const before = snapshotMapsForModule(modName);
+  console.log('\n----- maps BEFORE hook -----');
+  before.forEach(l => console.log('  ' + l));
+  console.log(`  (total ${before.length} lines)`);
+
+  // 找目标 range. hook 目标必在 .text, range.protection 必为 r-x.
+  // 我们只对这个 r-xp 段做 mprotect rwx -> 写跳板 -> 还原 r-x;
+  // .rodata (r--p) / .data (rw-p) 不动. 这就是用户思路的实现.
+  let range = null;
+  try { range = Process.findRangeByAddress(target); } catch (e) {}
+  if (!range) {
+    console.log('[err] findRangeByAddress failed');
+    return;
+  }
+  console.log(`\n[hook] target range: base=${range.base} size=0x${range.size.toString(16)} prot=${range.protection}`);
+  if (range.protection !== 'r-x' && range.protection !== 'r-xp') {
+    console.log(`[warn] target range prot=${range.protection}, 不是 r-x 段, 不该 hook 这里`);
+    /* 仍然继续, 让用户看到结果 */
+  }
+
+  // ---- 步骤 2: 经典 5 步 ----
+  console.log('\n----- step: mprotect rwx -----');
+  try {
+    Memory.protect(range.base, range.size, 'rwx');
+    console.log('[ok] mprotect rwx');
+  } catch (e) {
+    console.log('[err] mprotect rwx: ' + e.message);
+    return;
+  }
+
+  console.log('----- step: Interceptor.attach -----');
+  let listener;
+  try {
+    listener = Interceptor.attach(target, {
+      onEnter(args) { /* nop, 只测试段变化 */ }
+    });
+    console.log('[ok] attached');
+  } catch (e) {
+    console.log('[err] attach: ' + e.message);
+  }
+
+  console.log('----- step: Interceptor.flush -----');
+  try { Interceptor.flush(); console.log('[ok] flushed'); }
+  catch (e) { console.log('[err] flush: ' + e.message); }
+
+  console.log('----- step: mprotect r-x -----');
+  try {
+    Memory.protect(range.base, range.size, 'r-x');
+    console.log('[ok] mprotect r-x');
+  } catch (e) {
+    console.log('[err] mprotect r-x: ' + e.message);
+  }
+
+  // ---- 步骤 3: hook 后快照 ----
+  const after = snapshotMapsForModule(modName);
+  console.log('\n----- maps AFTER hook -----');
+  after.forEach(l => console.log('  ' + l));
+  console.log(`  (total ${after.length} lines)`);
+
+  // ---- 步骤 4: 评估 ----
+  console.log('\n----- DIFF -----');
+  console.log(`  segments before: ${before.length}, after: ${after.length}`);
+
+  const beforeRwxp = before.filter(l => l.includes('rwxp')).length;
+  const afterRwxp  = after.filter(l => l.includes('rwxp')).length;
+  console.log(`  rwxp segments before: ${beforeRwxp}, after: ${afterRwxp}`);
+
+  if (after.length > before.length) {
+    console.log(`  [!!] 段被撕了 ${after.length - before.length} 块`);
+  } else if (after.length === before.length && afterRwxp === beforeRwxp) {
+    console.log('  [PASS] 段数量和 rwxp 数量都没变, 经典方案 ok');
+  } else if (afterRwxp > beforeRwxp) {
+    console.log('  [!!] 没撕段但出现了 rwxp');
+  } else {
+    console.log('  [?] 段数变化但情况复杂, 看上面 diff');
+  }
+
+  // ---- 步骤 5: 清理 (可选) ----
+  if (listener) {
+    try { listener.detach(); Interceptor.flush(); } catch (e) {}
+  }
+  console.log('========== end ==========\n');
+}
+
 // ---------------- dlopen 拦截 ----------------
 function hookDlopen() {
   const targets = ['android_dlopen_ext', 'dlopen'];
@@ -961,6 +1089,7 @@ rpc.exports = {
   threads, fds, unix, tmp, hookDlopen,
   dlIter, rDebug, soList, linkMap,
   unlinkSelf,
+  testHookHide,
   detect,
 };
 
@@ -970,6 +1099,7 @@ Object.assign(globalThis, {
   threads, fds, unix, tmp, hookDlopen,
   dlIter, rDebug, soList, linkMap,
   unlinkSelf,
+  testHookHide,
   detect,
 });
 

@@ -27,14 +27,12 @@ _frida_agent_environment_init (void)
 #endif
 
 #ifdef HAVE_ANDROID
-  /* 同步摘链 (此时 g_dl_mutex 已释放, RELRO 稳定) 表面看时机正确, 但实测会
-   * 让 agent 后续 GLib/GIO init 阶段的 dlopen 触碰我们改过的链表导致挂掉,
-   * 报 "refused to load frida-agent".
-   *
-   * 改为后台延迟线程: sleep N 秒等 agent 全部 init 完 + 跟 server 建好
-   * 通讯后再摘. 此时 linker 不再 dlopen 任何东西, 改链表绝对安全.
-   * 需要导出 xiam_unlink_self_delayed (frida-agent-android.version 已加).  */
-  (void)xiam_unlink_self_delayed ();
+  /* 自动摘链已禁用 — 实测在某些设备 (如 panther/d76b1349) 触发
+   * libart DlOpenOatFile 析构时 dlclose 走到我们改过的链表,
+   * linker soinfo_free 触发 "is not in soinfo_list (double unload?)"
+   * abort. 摘链需要外部脚本通过 xiam_unlink_self_delayed/xiam_unlink_self
+   * 手动调用 (导出符号仍然保留). */
+  /* (void)xiam_unlink_self_delayed (); */
 #endif
 
 #ifdef _MSC_VER

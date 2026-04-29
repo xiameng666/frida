@@ -68,6 +68,7 @@ struct _GumExceptorBackend
 
   struct sigaction ** old_handlers;
   gint num_old_handlers;
+  gboolean libc_hooks_installed;
 
   GumInterceptor * interceptor;
 };
@@ -263,6 +264,16 @@ gum_exceptor_backend_attach (GumExceptorBackend * self)
     gum_original_sigaction (sig, &action, old_handler);
   }
 
+  /* xiam-stealth: skip the libc signal()/sigaction() interception when
+   * no-hook mode is on. The sigaction-based SIGSEGV handler above is still
+   * installed, so Memory.read* exception recovery keeps working. The cost
+   * is that an app re-registering its own SIGSEGV handler can override us. */
+  if (gum_exceptor_is_no_hook ())
+  {
+    self->libc_hooks_installed = FALSE;
+    return;
+  }
+
   gum_interceptor_begin_transaction (interceptor);
 
   gum_interceptor_replace (interceptor, gum_original_signal,
@@ -271,6 +282,8 @@ gum_exceptor_backend_attach (GumExceptorBackend * self)
       gum_exceptor_backend_replacement_sigaction, self, NULL);
 
   gum_interceptor_end_transaction (interceptor);
+
+  self->libc_hooks_installed = TRUE;
 }
 
 static void
@@ -279,12 +292,17 @@ gum_exceptor_backend_detach (GumExceptorBackend * self)
   GumInterceptor * interceptor = self->interceptor;
   gint i;
 
-  gum_interceptor_begin_transaction (interceptor);
+  if (self->libc_hooks_installed)
+  {
+    gum_interceptor_begin_transaction (interceptor);
 
-  gum_interceptor_revert (interceptor, gum_original_signal);
-  gum_interceptor_revert (interceptor, gum_original_sigaction);
+    gum_interceptor_revert (interceptor, gum_original_signal);
+    gum_interceptor_revert (interceptor, gum_original_sigaction);
 
-  gum_interceptor_end_transaction (interceptor);
+    gum_interceptor_end_transaction (interceptor);
+
+    self->libc_hooks_installed = FALSE;
+  }
 
   for (i = 0; i != self->num_old_handlers; i++)
     gum_exceptor_backend_detach_handler (self, i);

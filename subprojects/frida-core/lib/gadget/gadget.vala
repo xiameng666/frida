@@ -786,9 +786,11 @@ namespace Frida.Gadget {
 		private uint next_portal_membership_id = 1;
 
 		construct {
-			// xiam-stealth: 默认禁用 ExitMonitor + Gum.Exceptor，避免 hook
-			// libc 的 exit/_exit/abort/signal/sigaction（shadow-protect 反复修补）。
-			Gum.Exceptor.disable ();
+			// xiam-stealth: 默认 Exceptor 开 + no-hook 模式。
+			// 装 SIGSEGV/SIGBUS 的 sigaction handler 维持 Memory.read* 异常恢复,
+			// 但跳过对 libc signal()/sigaction() 的 gum_interceptor_replace。
+			// ExitMonitor 仍不构造——它必须 hook libc exit/_exit/abort。
+			Gum.Exceptor.set_no_hook (true);
 			thread_suspend_monitor = new ThreadSuspendMonitor (this);
 			unwind_sitter = new UnwindSitter (this);
 		}

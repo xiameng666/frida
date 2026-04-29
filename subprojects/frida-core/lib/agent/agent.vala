@@ -282,10 +282,17 @@ namespace Frida.Agent {
 		private async void start (owned FileDescriptorTablePadder padder) {
 			string[] tokens = agent_parameters.split ("|");
 			unowned string transport_uri = tokens[0];
-			// xiam-stealth: 默认关掉 exceptor / exit-monitor，避免 hook libc 的
-			// signal/sigaction/exit/_exit/abort（被 shadow-protect 反复打补丁）。
-			// 仍可通过 agent 参数 "exceptor:on" / "exit-monitor:on" 显式打开。
-			bool enable_exceptor = false;
+			// xiam-stealth: 默认 Exceptor 开 + no-hook 模式。
+			// Exceptor 装 SIGSEGV/SIGBUS 等 sigaction handler 让 Memory.read*
+			// 异常恢复正常工作；no-hook 模式下跳过对 libc signal()/sigaction()
+			// 的 gum_interceptor_replace, 完全不动 libc。
+			// ExitMonitor 仍默认关闭——它必须靠 hook libc exit/_exit/abort, 没法 stealth。
+			// opt-in 覆盖:
+			//   exceptor:off       完全禁用 Exceptor (代价: Memory.read* 越界即崩)
+			//   exceptor:hook      退回 frida 原生行为, 让 Exceptor 接管 libc signal/sigaction
+			//   exit-monitor:on    打开 ExitMonitor (会 hook libc)
+			bool enable_exceptor = true;
+			bool exceptor_no_hook = true;
 			bool enable_exit_monitor = false;
 			bool enable_thread_suspend_monitor = true;
 			bool enable_unwind_sitter = true;
@@ -298,6 +305,10 @@ namespace Frida.Agent {
 					enable_exceptor = false;
 				else if (option == "exceptor:on")
 					enable_exceptor = true;
+				else if (option == "exceptor:hook")
+					exceptor_no_hook = false;
+				else if (option == "exceptor:no-hook")
+					exceptor_no_hook = true;
 				else if (option == "exit-monitor:off")
 					enable_exit_monitor = false;
 				else if (option == "exit-monitor:on")
@@ -314,6 +325,8 @@ namespace Frida.Agent {
 
 			if (!enable_exceptor)
 				Gum.Exceptor.disable ();
+			else if (exceptor_no_hook)
+				Gum.Exceptor.set_no_hook (true);
 
 			{
 				var interceptor = Gum.Interceptor.obtain ();

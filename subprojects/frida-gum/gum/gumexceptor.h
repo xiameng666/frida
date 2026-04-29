@@ -83,6 +83,9 @@ struct _GumExceptorScope
 
 GUM_API void gum_exceptor_disable (void);
 
+GUM_API void gum_exceptor_set_no_hook (gboolean no_hook);
+GUM_API gboolean gum_exceptor_is_no_hook (void);
+
 GUM_API GumExceptor * gum_exceptor_obtain (void);
 
 GUM_API void gum_exceptor_reset (GumExceptor * self);

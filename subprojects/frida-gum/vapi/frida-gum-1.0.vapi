@@ -701,6 +701,8 @@ namespace Gum {
 
 	public class Exceptor : GLib.Object {
 		public static void disable ();
+		public static void set_no_hook (bool no_hook);
+		public static bool is_no_hook ();
 		public static Exceptor obtain ();
 	}
 

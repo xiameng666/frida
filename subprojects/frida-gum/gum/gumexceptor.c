@@ -51,6 +51,11 @@ G_DEFINE_TYPE (GumExceptor, gum_exceptor, G_TYPE_OBJECT)
 G_LOCK_DEFINE_STATIC (the_exceptor);
 static GumExceptor * the_exceptor = NULL;
 static gboolean gum_exceptor_is_available = TRUE;
+/* xiam-stealth: when TRUE, backend installs the SIGSEGV signal handler so
+ * Memory.read*-style exception recovery still works, but skips replacing
+ * libc's signal()/sigaction(). Lets users call gum_exceptor_obtain() without
+ * patching libc. */
+static gboolean gum_exceptor_no_hook_flag = FALSE;
 
 static void
 gum_exceptor_class_init (GumExceptorClass * klass)
@@ -103,6 +108,18 @@ gum_exceptor_disable (void)
   g_assert (the_exceptor == NULL);
 
   gum_exceptor_is_available = FALSE;
+}
+
+void
+gum_exceptor_set_no_hook (gboolean no_hook)
+{
+  gum_exceptor_no_hook_flag = no_hook;
+}
+
+gboolean
+gum_exceptor_is_no_hook (void)
+{
+  return gum_exceptor_no_hook_flag;
 }
 
 GumExceptor *

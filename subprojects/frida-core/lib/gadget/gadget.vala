@@ -774,7 +774,7 @@ namespace Frida.Gadget {
 			construct;
 		}
 
-		private ExitMonitor exit_monitor;
+		private ExitMonitor? exit_monitor;
 		private ThreadSuspendMonitor thread_suspend_monitor;
 		private UnwindSitter unwind_sitter;
 
@@ -786,7 +786,9 @@ namespace Frida.Gadget {
 		private uint next_portal_membership_id = 1;
 
 		construct {
-			exit_monitor = new ExitMonitor (this, MainContext.default ());
+			// xiam-stealth: 默认禁用 ExitMonitor + Gum.Exceptor，避免 hook
+			// libc 的 exit/_exit/abort/signal/sigaction（shadow-protect 反复修补）。
+			Gum.Exceptor.disable ();
 			thread_suspend_monitor = new ThreadSuspendMonitor (this);
 			unwind_sitter = new UnwindSitter (this);
 		}

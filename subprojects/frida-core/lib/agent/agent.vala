@@ -282,11 +282,11 @@ namespace Frida.Agent {
 		private async void start (owned FileDescriptorTablePadder padder) {
 			string[] tokens = agent_parameters.split ("|");
 			unowned string transport_uri = tokens[0];
-			bool enable_exceptor = true;
-#if DARWIN
-			enable_exceptor = !Gum.Darwin.query_hardened ();
-#endif
-			bool enable_exit_monitor = true;
+			// xiam-stealth: 默认关掉 exceptor / exit-monitor，避免 hook libc 的
+			// signal/sigaction/exit/_exit/abort（被 shadow-protect 反复打补丁）。
+			// 仍可通过 agent 参数 "exceptor:on" / "exit-monitor:on" 显式打开。
+			bool enable_exceptor = false;
+			bool enable_exit_monitor = false;
 			bool enable_thread_suspend_monitor = true;
 			bool enable_unwind_sitter = true;
 			foreach (unowned string option in tokens[1:]) {
@@ -296,13 +296,21 @@ namespace Frida.Agent {
 					stop_thread_on_unload = false;
 				else if (option == "exceptor:off")
 					enable_exceptor = false;
+				else if (option == "exceptor:on")
+					enable_exceptor = true;
 				else if (option == "exit-monitor:off")
 					enable_exit_monitor = false;
+				else if (option == "exit-monitor:on")
+					enable_exit_monitor = true;
 				else if (option == "thread-suspend-monitor:off")
 					enable_thread_suspend_monitor = false;
 				else if (option == "unwind-sitter:off")
 					enable_unwind_sitter = false;
 			}
+#if DARWIN
+			if (enable_exceptor && Gum.Darwin.query_hardened ())
+				enable_exceptor = false;
+#endif
 
 			if (!enable_exceptor)
 				Gum.Exceptor.disable ();

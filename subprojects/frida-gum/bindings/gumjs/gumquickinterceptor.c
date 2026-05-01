@@ -166,6 +166,9 @@ static void gum_quick_replace_entry_revert_and_free (
     GumQuickReplaceEntry * entry);
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_revert)
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_flush)
+GUMJS_DECLARE_FUNCTION (gumjs_interceptor_enable_shadow)
+GUMJS_DECLARE_FUNCTION (gumjs_interceptor_disable_shadow)
+GUMJS_DECLARE_GETTER (gumjs_interceptor_get_shadow_enabled)
 
 GUMJS_DECLARE_FUNCTION (gumjs_invocation_listener_detach)
 static void gum_quick_invocation_listener_dispose (GObject * object);
@@ -278,6 +281,10 @@ static const JSCFunctionListEntry gumjs_interceptor_entries[] =
   JS_CFUNC_DEF ("_replaceFast", 0, gumjs_interceptor_replace_fast),
   JS_CFUNC_DEF ("revert", 0, gumjs_interceptor_revert),
   JS_CFUNC_DEF ("flush", 0, gumjs_interceptor_flush),
+  JS_CFUNC_DEF ("enableShadow", 0, gumjs_interceptor_enable_shadow),
+  JS_CFUNC_DEF ("disableShadow", 0, gumjs_interceptor_disable_shadow),
+  JS_CGETSET_DEF ("shadowEnabled",
+      gumjs_interceptor_get_shadow_enabled, NULL),
 };
 
 static const JSClassDef gumjs_invocation_listener_def =
@@ -773,6 +780,33 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
   gum_interceptor_begin_transaction (self->interceptor);
 
   return JS_UNDEFINED;
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_interceptor_enable_shadow)
+{
+  GumQuickInterceptor * self = gumjs_get_parent_module (core);
+
+  /* 探测 KPM 并开启. 失败时 enable_shadow 内部保持 use_shadow=FALSE.
+   * 返回 bool, 让用户判断是否真的生效. */
+  gum_interceptor_enable_shadow (self->interceptor, TRUE);
+  return JS_NewBool (ctx,
+      gum_interceptor_is_shadow_enabled (self->interceptor));
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_interceptor_disable_shadow)
+{
+  GumQuickInterceptor * self = gumjs_get_parent_module (core);
+
+  gum_interceptor_enable_shadow (self->interceptor, FALSE);
+  return JS_UNDEFINED;
+}
+
+GUMJS_DEFINE_GETTER (gumjs_interceptor_get_shadow_enabled)
+{
+  GumQuickInterceptor * self = gumjs_get_parent_module (core);
+
+  return JS_NewBool (ctx,
+      gum_interceptor_is_shadow_enabled (self->interceptor));
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_invocation_listener_detach)

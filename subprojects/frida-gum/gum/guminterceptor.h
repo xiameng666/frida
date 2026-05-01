@@ -96,6 +96,16 @@ GUM_API gboolean gum_interceptor_is_locked (GumInterceptor * self);
 GUM_API gsize gum_interceptor_detect_hook_size (gconstpointer code,
     csh capstone, cs_insn * insn);
 
+/*
+ * KPM text_shadow 集成开关.
+ *   - enable_shadow(TRUE) 后续 attach 自动 PTE 隐藏 (Android arm64 + KPM 已装)
+ *   - enable_shadow(FALSE) 后续 attach 不再保护, 已保护的页不动
+ *   - is_shadow_enabled 返回当前状态 (KPM 不可用时永远 FALSE)
+ */
+GUM_API void gum_interceptor_enable_shadow (GumInterceptor * self,
+    gboolean enable);
+GUM_API gboolean gum_interceptor_is_shadow_enabled (GumInterceptor * self);
+
 G_END_DECLS
 
 #endif

@@ -9,6 +9,7 @@
 
 #include "guminterceptor.h"
 
+#include "gum-text-shadow.h"
 #include "gumcodesegment.h"
 #include "guminterceptor-priv.h"
 #include "gumlibc.h"
@@ -68,6 +69,13 @@ struct _GumInterceptor
   volatile guint selected_thread_id;
 
   GumInterceptorTransaction current_transaction;
+
+  /*
+   * KPM text_shadow 集成开关. JS 端调 Interceptor.enableShadow() 置为 TRUE.
+   * transaction_end 时若该标志开 + KPM 可用, 会在 patch_code_pages 前后
+   * 做原件保存 + prctl(PROTECT). 关闭后已保护的页保持不动, 只影响后续 attach.
+   */
+  gboolean use_shadow;
 };
 
 enum _GumInstrumentationError
@@ -272,6 +280,8 @@ gum_interceptor_init (GumInterceptor * self)
   gum_code_allocator_init (&self->allocator, GUM_INTERCEPTOR_CODE_SLICE_SIZE);
 
   gum_interceptor_transaction_init (&self->current_transaction, self);
+
+  self->use_shadow = FALSE;
 }
 
 static void
@@ -345,6 +355,30 @@ the_interceptor_weak_notify (gpointer data,
   _the_interceptor = NULL;
 
   g_mutex_unlock (&_gum_interceptor_lock);
+}
+
+void
+gum_interceptor_enable_shadow (GumInterceptor * self,
+                               gboolean enable)
+{
+  if (enable)
+  {
+    /* 第一次开启时探测 KPM. 探测失败 → use_shadow 保持 FALSE, 后续 transaction
+     * 不会进入 shadow 路径. 调用方可通过 is_shadow_enabled 验证是否生效. */
+    if (!gum_text_shadow_init ())
+      return;
+    self->use_shadow = TRUE;
+  }
+  else
+  {
+    self->use_shadow = FALSE;
+  }
+}
+
+gboolean
+gum_interceptor_is_shadow_enabled (GumInterceptor * self)
+{
+  return self->use_shadow && gum_text_shadow_is_available ();
 }
 
 GumAttachReturn
@@ -985,36 +1019,86 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
     g_ptr_array_add (addresses, address);
   g_ptr_array_sort (addresses, (GCompareFunc) gum_page_address_compare);
 
-  if (gum_process_get_code_signing_policy () == GUM_CODE_SIGNING_REQUIRED)
+  /*
+   * KPM text_shadow 集成:
+   *   1) 写蹦床之前预存所有 dirty 页的"干净"副本到用户态 shadow pool.
+   *      必须在 patch_code_pages 内的 mprotect-RWX 之前完成, 否则拷到的
+   *      内容里可能已经混入新写的蹦床字节. shadow pool 内部按页缓存,
+   *      同页第二次保存是 no-op (返回首次的快照).
+   *   2) patch_code_pages 完成 (mprotect 已恢复) 后, 对每个 dirty 函数
+   *      地址调 prctl(PROTECT). 同页多函数自动复用 alt 页, kernel 走
+   *      append 分支只追加蹦床白名单.
+   */
   {
-    guint addr_index;
+    gboolean shadow_active =
+        interceptor->use_shadow && gum_text_shadow_is_available ();
+    guint i;
 
-    for (addr_index = 0; addr_index != addresses->len; addr_index++)
+    if (shadow_active)
     {
-      gpointer target_page;
-      GArray * pending;
-      guint i;
+      for (i = 0; i != addresses->len; i++)
+        gum_text_shadow_save_original_page (g_ptr_array_index (addresses, i));
+    }
 
-      target_page = g_ptr_array_index (addresses, addr_index);
+    if (gum_process_get_code_signing_policy () == GUM_CODE_SIGNING_REQUIRED)
+    {
+      guint addr_index;
 
-      pending = g_hash_table_lookup (self->pending_update_tasks, target_page);
-      g_assert (pending != NULL);
-
-      for (i = 0; i != pending->len; i++)
+      for (addr_index = 0; addr_index != addresses->len; addr_index++)
       {
-        GumUpdateTask * update;
+        gpointer target_page;
+        GArray * pending;
+        guint j;
 
-        update = &g_array_index (pending, GumUpdateTask, i);
+        target_page = g_ptr_array_index (addresses, addr_index);
 
-        update->func (interceptor, update->ctx,
-            _gum_interceptor_backend_get_function_address (update->ctx));
+        pending = g_hash_table_lookup (self->pending_update_tasks,
+            target_page);
+        g_assert (pending != NULL);
+
+        for (j = 0; j != pending->len; j++)
+        {
+          GumUpdateTask * update;
+
+          update = &g_array_index (pending, GumUpdateTask, j);
+
+          update->func (interceptor, update->ctx,
+              _gum_interceptor_backend_get_function_address (update->ctx));
+        }
       }
     }
-  }
-  else if (!gum_memory_patch_code_pages (addresses, FALSE, gum_apply_updates,
-        self))
-  {
-    g_abort ();
+    else if (!gum_memory_patch_code_pages (addresses, FALSE, gum_apply_updates,
+          self))
+    {
+      g_abort ();
+    }
+
+    if (shadow_active)
+    {
+      for (i = 0; i != addresses->len; i++)
+      {
+        gpointer target_page;
+        GArray * pending;
+        guint j;
+
+        target_page = g_ptr_array_index (addresses, i);
+        pending = g_hash_table_lookup (self->pending_update_tasks,
+            target_page);
+        if (pending == NULL)
+          continue;
+
+        for (j = 0; j != pending->len; j++)
+        {
+          GumUpdateTask * update;
+          gpointer func_addr;
+
+          update = &g_array_index (pending, GumUpdateTask, j);
+          func_addr =
+              _gum_interceptor_backend_get_function_address (update->ctx);
+          gum_text_shadow_protect (func_addr);
+        }
+      }
+    }
   }
 
   g_ptr_array_unref (addresses);

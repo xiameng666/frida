@@ -144,6 +144,9 @@ static void gum_v8_handle_replace_ret (GumV8Interceptor * self,
 static void gum_v8_replace_entry_free (GumV8ReplaceEntry * entry);
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_revert)
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_flush)
+GUMJS_DECLARE_FUNCTION (gumjs_interceptor_enable_shadow)
+GUMJS_DECLARE_FUNCTION (gumjs_interceptor_disable_shadow)
+GUMJS_DECLARE_GETTER (gumjs_interceptor_get_shadow_enabled)
 
 GUMJS_DECLARE_FUNCTION (gumjs_invocation_listener_detach)
 static void gum_v8_invocation_listener_dispose (GObject * object);
@@ -260,8 +263,17 @@ static const GumV8Function gumjs_interceptor_functions[] =
   { "_replaceFast", gumjs_interceptor_replace_fast },
   { "revert", gumjs_interceptor_revert },
   { "flush", gumjs_interceptor_flush },
+  { "enableShadow", gumjs_interceptor_enable_shadow },
+  { "disableShadow", gumjs_interceptor_disable_shadow },
 
   { NULL, NULL }
+};
+
+static const GumV8Property gumjs_interceptor_values[] =
+{
+  { "shadowEnabled", gumjs_interceptor_get_shadow_enabled, NULL },
+
+  { NULL, NULL, NULL }
 };
 
 static const GumV8Function gumjs_invocation_listener_functions[] =
@@ -337,6 +349,7 @@ _gum_v8_interceptor_init (GumV8Interceptor * self,
   auto interceptor = _gum_v8_create_module ("Interceptor", scope, isolate);
   _gum_v8_module_add (module, interceptor, gumjs_interceptor_functions,
       isolate);
+  _gum_v8_module_add (module, interceptor, gumjs_interceptor_values, isolate);
 
   auto listener = _gum_v8_create_class ("InvocationListener", nullptr, scope,
       module, isolate);
@@ -781,6 +794,28 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
 
   gum_interceptor_end_transaction (interceptor);
   gum_interceptor_begin_transaction (interceptor);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_interceptor_enable_shadow)
+{
+  /* 探测 KPM 并开启. 探测失败时 enable_shadow 内部会保持 use_shadow=FALSE.
+   * 返回 bool 让用户感知是否真的生效. */
+  gum_interceptor_enable_shadow (module->interceptor, TRUE);
+  info.GetReturnValue ().Set (
+      gum_interceptor_is_shadow_enabled (module->interceptor)
+          ? True (isolate) : False (isolate));
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_interceptor_disable_shadow)
+{
+  gum_interceptor_enable_shadow (module->interceptor, FALSE);
+}
+
+GUMJS_DEFINE_GETTER (gumjs_interceptor_get_shadow_enabled)
+{
+  info.GetReturnValue ().Set (
+      gum_interceptor_is_shadow_enabled (module->interceptor)
+          ? True (isolate) : False (isolate));
 }
 
 GUMJS_DEFINE_CLASS_METHOD (gumjs_invocation_listener_detach,

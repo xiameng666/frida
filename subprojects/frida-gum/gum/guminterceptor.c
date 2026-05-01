@@ -22,6 +22,9 @@
 #ifdef HAVE_DARWIN
 # include <mach/mach.h>
 #endif
+#ifdef HAVE_ANDROID
+# include <android/log.h>
+#endif
 
 #ifdef HAVE_MIPS
 # define GUM_INTERCEPTOR_CODE_SLICE_SIZE 1024
@@ -281,7 +284,36 @@ gum_interceptor_init (GumInterceptor * self)
 
   gum_interceptor_transaction_init (&self->current_transaction, self);
 
-  self->use_shadow = FALSE;
+  /*
+   * 启动期自适应: 探测 KPM (xiaojia-hide) 是否已加载.
+   *   - 装了 KPM     → use_shadow=TRUE, 后续所有 attach (含 frida 内部装在
+   *                     r_brk 上的 rtld notifier 等) 默认走 PTE 隐藏
+   *   - 没装 KPM     → use_shadow=FALSE, 行为退化为普通 frida
+   *   - 非 Android   → gum_text_shadow_init 是 stub 返回 FALSE
+   *
+   * 这步必须早于第一次 gum_interceptor_attach (例如 rtld notifier 的初始化),
+   * 而 gum_interceptor_obtain 是单例, init 只跑一次, 所以放在 instance init
+   * 里最合适.
+   *
+   * 用户态 backup: JS 端可调 Interceptor.disableShadow() 临时关掉, 或
+   * Interceptor.enableShadow() 重新开. 主流场景是装了 KPM 后偶尔需要
+   * disable 来跑某些不能走 shadow 的 attach (调试 / 排查 hook 失效).
+   */
+  self->use_shadow = gum_text_shadow_init ();
+
+#ifdef HAVE_ANDROID
+  if (self->use_shadow)
+  {
+    __android_log_print (ANDROID_LOG_INFO, "xiam",
+        "[text_shadow] KPM detected, default enabled "
+        "(use Interceptor.disableShadow() to opt out)");
+  }
+  else
+  {
+    __android_log_print (ANDROID_LOG_INFO, "xiam",
+        "[text_shadow] KPM not loaded, running in plain frida mode");
+  }
+#endif
 }
 
 static void
@@ -361,18 +393,27 @@ void
 gum_interceptor_enable_shadow (GumInterceptor * self,
                                gboolean enable)
 {
+  /*
+   * 运行时翻转标志. KPM 探测在 instance init 时已完成 (gum_text_shadow_init
+   * 内部幂等, 多次调用只探测一次).
+   *
+   *   enable=TRUE 但 KPM 未装   → 调 init() 仍返回 FALSE, use_shadow 保持
+   *                                FALSE. 用户可通过 is_shadow_enabled 验证.
+   *   enable=FALSE              → 仅清标志. 已经被保护的页 PTE 状态不动,
+   *                                进程退出时 kernel do_group_exit hook 清理.
+   *                                后续 attach 不再注册 PTE 保护.
+   */
   if (enable)
-  {
-    /* 第一次开启时探测 KPM. 探测失败 → use_shadow 保持 FALSE, 后续 transaction
-     * 不会进入 shadow 路径. 调用方可通过 is_shadow_enabled 验证是否生效. */
-    if (!gum_text_shadow_init ())
-      return;
-    self->use_shadow = TRUE;
-  }
+    self->use_shadow = gum_text_shadow_init ();
   else
-  {
     self->use_shadow = FALSE;
-  }
+
+#ifdef HAVE_ANDROID
+  __android_log_print (ANDROID_LOG_INFO, "xiam",
+      "[text_shadow] enable_shadow: requested=%s use_shadow=%s",
+      enable ? "TRUE" : "FALSE",
+      self->use_shadow ? "TRUE" : "FALSE");
+#endif
 }
 
 gboolean
@@ -1034,10 +1075,24 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
         interceptor->use_shadow && gum_text_shadow_is_available ();
     guint i;
 
+#ifdef HAVE_ANDROID
+    __android_log_print (ANDROID_LOG_INFO, "xiam",
+        "[text_shadow] transaction_end: shadow_active=%d, %u dirty pages",
+        shadow_active, addresses->len);
+#endif
+
     if (shadow_active)
     {
       for (i = 0; i != addresses->len; i++)
-        gum_text_shadow_save_original_page (g_ptr_array_index (addresses, i));
+      {
+        gpointer p = g_ptr_array_index (addresses, i);
+#ifdef HAVE_ANDROID
+        __android_log_print (ANDROID_LOG_INFO, "xiam",
+            "[text_shadow] transaction_end: pre-save page %u/%u: %p",
+            i + 1, addresses->len, p);
+#endif
+        gum_text_shadow_save_original_page (p);
+      }
     }
 
     if (gum_process_get_code_signing_policy () == GUM_CODE_SIGNING_REQUIRED)
@@ -1095,9 +1150,18 @@ gum_interceptor_transaction_end (GumInterceptorTransaction * self)
           update = &g_array_index (pending, GumUpdateTask, j);
           func_addr =
               _gum_interceptor_backend_get_function_address (update->ctx);
+#ifdef HAVE_ANDROID
+          __android_log_print (ANDROID_LOG_INFO, "xiam",
+              "[text_shadow] transaction_end: post-protect func=%p (page=%p)",
+              func_addr, target_page);
+#endif
           gum_text_shadow_protect (func_addr);
         }
       }
+#ifdef HAVE_ANDROID
+      __android_log_print (ANDROID_LOG_INFO, "xiam",
+          "[text_shadow] transaction_end: done");
+#endif
     }
   }
 

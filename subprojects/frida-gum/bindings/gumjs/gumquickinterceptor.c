@@ -8,6 +8,10 @@
 
 #include "gumquickmacros.h"
 
+#ifdef HAVE_ANDROID
+# include <android/log.h>
+#endif
+
 #define GUM_QUICK_TYPE_INVOCATION_LISTENER \
     (gum_quick_invocation_listener_get_type ())
 #define GUM_QUICK_TYPE_JS_CALL_LISTENER \
@@ -785,12 +789,16 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
 GUMJS_DEFINE_FUNCTION (gumjs_interceptor_enable_shadow)
 {
   GumQuickInterceptor * self = gumjs_get_parent_module (core);
+  gboolean enabled;
 
-  /* 探测 KPM 并开启. 失败时 enable_shadow 内部保持 use_shadow=FALSE.
-   * 返回 bool, 让用户判断是否真的生效. */
   gum_interceptor_enable_shadow (self->interceptor, TRUE);
-  return JS_NewBool (ctx,
-      gum_interceptor_is_shadow_enabled (self->interceptor));
+  enabled = gum_interceptor_is_shadow_enabled (self->interceptor);
+#ifdef HAVE_ANDROID
+  __android_log_print (ANDROID_LOG_INFO, "xiam",
+      "[text_shadow] JS Interceptor.enableShadow() → %s",
+      enabled ? "TRUE" : "FALSE");
+#endif
+  return JS_NewBool (ctx, enabled);
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_interceptor_disable_shadow)
@@ -798,6 +806,10 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_disable_shadow)
   GumQuickInterceptor * self = gumjs_get_parent_module (core);
 
   gum_interceptor_enable_shadow (self->interceptor, FALSE);
+#ifdef HAVE_ANDROID
+  __android_log_print (ANDROID_LOG_INFO, "xiam",
+      "[text_shadow] JS Interceptor.disableShadow()");
+#endif
   return JS_UNDEFINED;
 }
 

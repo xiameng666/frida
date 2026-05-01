@@ -10,6 +10,9 @@
 #include "gumv8scope.h"
 
 #include <errno.h>
+#ifdef HAVE_ANDROID
+# include <android/log.h>
+#endif
 
 #define GUMJS_MODULE_NAME Interceptor
 
@@ -798,17 +801,25 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
 
 GUMJS_DEFINE_FUNCTION (gumjs_interceptor_enable_shadow)
 {
-  /* 探测 KPM 并开启. 探测失败时 enable_shadow 内部会保持 use_shadow=FALSE.
-   * 返回 bool 让用户感知是否真的生效. */
+  /* 探测 KPM 并开启 (init 时已自动探测过, 这里通常只是把已 disable 的标志
+   * 重新置回 TRUE). 返回 bool 让用户感知是否真的生效. */
   gum_interceptor_enable_shadow (module->interceptor, TRUE);
-  info.GetReturnValue ().Set (
-      gum_interceptor_is_shadow_enabled (module->interceptor)
-          ? True (isolate) : False (isolate));
+  gboolean enabled = gum_interceptor_is_shadow_enabled (module->interceptor);
+#ifdef HAVE_ANDROID
+  __android_log_print (ANDROID_LOG_INFO, "xiam",
+      "[text_shadow] JS Interceptor.enableShadow() → %s",
+      enabled ? "TRUE" : "FALSE");
+#endif
+  info.GetReturnValue ().Set (enabled ? True (isolate) : False (isolate));
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_interceptor_disable_shadow)
 {
   gum_interceptor_enable_shadow (module->interceptor, FALSE);
+#ifdef HAVE_ANDROID
+  __android_log_print (ANDROID_LOG_INFO, "xiam",
+      "[text_shadow] JS Interceptor.disableShadow()");
+#endif
 }
 
 GUMJS_DEFINE_GETTER (gumjs_interceptor_get_shadow_enabled)

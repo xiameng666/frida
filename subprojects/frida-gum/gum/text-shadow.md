@@ -52,26 +52,76 @@ gum_interceptor_attach
                                                                     分配 alt + 切 PTE 到 shadow
 ```
 
-## 三个用户态 API
+## 默认行为: 启动时自适应
+
+`gum_interceptor_init` (instance init, 早于任何 attach 包括 frida 内部
+装在 r_brk 上的 rtld notifier) 自动调 `gum_text_shadow_init()` 探测 KPM:
+
+| 环境               | 探测结果   | 默认 use_shadow | 行为                        |
+|--------------------|------------|-----------------|-----------------------------|
+| Android arm64+KPM  | TRUE       | **TRUE**        | 全部 attach 走 PTE 隐藏     |
+| Android arm64 无 KPM | FALSE     | FALSE           | 退化为普通 frida            |
+| 非 Android arm64   | FALSE (stub) | FALSE         | 退化为普通 frida            |
+
+启动期 logcat (tag=`xiam`):
+
+```
+I/xiam   [text_shadow] probe: prctl(0x45822, 0,0,0,0) = 0 errno=0
+I/xiam   [text_shadow] init: KPM available, ready
+I/xiam   [text_shadow] KPM detected, default enabled (use Interceptor.disableShadow() to opt out)
+```
+
+或:
+
+```
+I/xiam   [text_shadow] probe: prctl(0x45822, 0,0,0,0) = -1 errno=22
+I/xiam   [text_shadow] init: KPM not available, all APIs no-op
+I/xiam   [text_shadow] KPM not loaded, running in plain frida mode
+```
+
+## 用户态 API (作为 backup 控制)
 
 ```js
-const ok = Interceptor.enableShadow();   // 探测 KPM 并开启, 返回是否成功
-                                         //   - 装了 KPM:  true
-                                         //   - 没装 KPM:  false (静默 fallback)
-                                         //   - 非 Android arm64: 永远 false
+Interceptor.shadowEnabled                // getter: 当前状态 (永远反映真实状态,
+                                         //   KPM 不可用时永远 false)
 
-Interceptor.disableShadow();             // 关闭, 不影响已保护的页, 只让后续 attach
-                                         //   不再注册 PTE 保护
+Interceptor.enableShadow()               // 强制开启, 返回 bool. 装了 KPM 后
+                                         //   通常用于 disable 之后再开回来.
 
-const v = Interceptor.shadowEnabled;     // 当前状态 (KPM 不可用时永远 false)
+Interceptor.disableShadow()              // 关闭后续 attach 的 shadow 保护.
+                                         //   ★ 主要使用场景: 装了 KPM 默认 enable,
+                                         //   但某些 attach 不想走 shadow 时
+                                         //   (如要与原版 frida 行为对齐做对比).
+```
+
+### 典型用法
+
+```js
+// 默认情况下什么都不用做, 装了 KPM 自动生效
+Interceptor.attach(Module.findExportByName("libc.so", "open"), {
+  onEnter(args) { ... }
+});
+
+// 主动判断 (用于 host 端 RPC 探测)
+const enabled = Interceptor.shadowEnabled;
+console.log("[shadow]", enabled);
+
+// 临时关闭, 跑某些不能走 shadow 的 attach
+Interceptor.disableShadow();
+Interceptor.attach(specialFunc, ...);  // 这个不受 PTE 保护
+Interceptor.enableShadow();             // 恢复
+Interceptor.attach(otherFunc, ...);    // 又走 shadow
 ```
 
 ### 与现有 API 的关系
 
-* 在 `Interceptor.attach()` 之前调 `enableShadow()` —— 当批 attach 的 hook
-  全部走 shadow.
-* `attach` 之后再调 `enableShadow()` —— 已 attach 的 hook **不会追溯保护**
-  (前面的蹦床仍然可读), 只对后续 attach 生效.
+* `Interceptor.attach()` 之前已经默认开启 (装了 KPM 的环境), 不需要任何
+  额外代码.
+* `attach` 之后调 `disableShadow` —— 已保护的页 PTE 不动, 只影响后续
+  attach 不再注册新的 PTE 保护.
+* `attach` 之后调 `enableShadow` —— 已 attach 的 hook **不会追溯保护**
+  (前面的蹦床仍然可读), 只对后续 attach 生效. 想让 r_brk 等 frida 内部
+  hook 也享受保护必须默认 enable, 因此默认行为就是这样.
 * `Interceptor.flush()` 触发的写出仍然走同一个 `transaction_end`,
   shadow 集成对它透明.
 
@@ -173,17 +223,44 @@ shadow pool:
 5. **JS API 不能追溯保护** —— `enableShadow()` 之前的 attach 不被
    保护. 文档要求用户把 `enableShadow()` 放脚本第一行.
 
-## 测试
+## 测试套件
 
-见 `tools/feature-scan.js` 的 `testShadow*` RPC 套件 (待补).
-最小验证:
+`tools/test-shadow.js` + `tools/test-shadow.py` 提供完整自动测试:
 
-```js
-const ok = Interceptor.enableShadow();
-if (!ok) throw new Error("KPM not loaded");
-const open = Module.findExportByName("libc.so", "open");
-Interceptor.attach(open, {});
-// 同进程自读: 应该拿到 ELF 原始字节, 不是 B 跳板
-const bytes = Memory.readByteArray(open, 4);
-console.log(hexdump(bytes));   // 期望: 原始 stp/sub 等指令
+```bash
+# 1. 启动 logcat (另一个终端)
+adb logcat -c && adb logcat -s xiam:I
+
+# 2. 跑所有测试
+python3 tools/test-shadow.py -f com.android.settings --test all
+
+# 3. 单项测试
+python3 tools/test-shadow.py -f com.android.settings --test selfRead --func open
+python3 tools/test-shadow.py -f com.android.settings --test segCount
+python3 tools/test-shadow.py -f com.android.settings --test samePage
 ```
+
+测试覆盖:
+* **status** (`isShadowEnabled`)        — 启动期 KPM 探测结果
+* **selfRead**                          — hook 后同进程读 .text 是否拿干净字节
+* **hookFires**                         — PTE 隐藏后 hook 仍然 fire (功能未破坏)
+* **segCount**                          — libc.so 不被撕段 (vma perm 层验证)
+* **samePage**                          — 同页多函数 attach 共用 alt + append 白名单
+
+## 全链路 logcat (tag=xiam, level=INFO)
+
+| 事件                              | 日志样例                                                              |
+|-----------------------------------|-----------------------------------------------------------------------|
+| 启动期探测                        | `[text_shadow] probe: prctl(0x45822, 0,0,0,0) = 0 errno=0`            |
+| init 成功                         | `[text_shadow] init: KPM available, ready`                            |
+| init 失败                         | `[text_shadow] init: KPM not available, all APIs no-op`               |
+| 默认状态                          | `[text_shadow] KPM detected, default enabled ...`                     |
+| JS enable/disable                 | `[text_shadow] JS Interceptor.enableShadow() → TRUE`                  |
+| transaction_end 入口              | `[text_shadow] transaction_end: shadow_active=1, 3 dirty pages`       |
+| 预存原件                          | `[text_shadow] save: page=0xXXX new buf=0xYYY (first 4B=...)`         |
+| 预存复用                          | `[text_shadow] save: page=0xXXX (cached, buf=0xYYY)`                  |
+| protect 成功                      | `[text_shadow] protect: func=0xXXX page=0xYYY orig=0xZZZ ok`          |
+| protect 失败                      | `[text_shadow] protect: ... FAILED ret=-1 errno=22`                   |
+| transaction_end 完成              | `[text_shadow] transaction_end: done`                                 |
+| pool 新增 chunk                   | `[text_shadow] pool: new chunk base=0xXXX size=0x200000`              |
+| pool 分配失败                     | `[text_shadow] pool: mmap N bytes FAILED errno=...`                   |

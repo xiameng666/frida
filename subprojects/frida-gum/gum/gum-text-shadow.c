@@ -17,12 +17,21 @@
 
 #if defined (HAVE_ANDROID) && defined (HAVE_ARM64)
 
+#include <android/log.h>
 #include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#define GUM_TS_LOG_TAG  "xiam"
+#define GUM_TS_LOGI(...)  \
+    __android_log_print (ANDROID_LOG_INFO,  GUM_TS_LOG_TAG, __VA_ARGS__)
+#define GUM_TS_LOGW(...)  \
+    __android_log_print (ANDROID_LOG_WARN,  GUM_TS_LOG_TAG, __VA_ARGS__)
+#define GUM_TS_LOGE(...)  \
+    __android_log_print (ANDROID_LOG_ERROR, GUM_TS_LOG_TAG, __VA_ARGS__)
 
 #define GUM_TS_PROTECT_OPTION    0x45820
 #define GUM_TS_UNPROTECT_OPTION  0x45821
@@ -54,23 +63,20 @@ static gboolean
 gum_ts_probe (void)
 {
   /*
-   * 用 (option=0x45820, arg1=0) 当 sentinel:
-   *   - KPM 装了: kernel text_shadow.c 走 protect_page(0, 0), pte walk
-   *     失败 → 返回 -1, errno 不一定是 EINVAL.
-   *   - KPM 没装: kernel 不识别这个 option → 返回 -1, errno=EINVAL.
-   *
-   * 区分方法: 真正可用时 errno 不是 EINVAL (内核里 protect_page 失败
-   * 是直接 return -1, 不会设 errno; 但 prctl 系统调用层若识别 option
-   * 不是标准的, 会自己 set errno=EINVAL).
-   *
-   * 这里采用更稳健的策略: 调一次 CLEAR_ALL (0x45822, 0,0,0,0), KPM
-   * 端直接 args->ret=0, prctl 返回 0; 没装 KPM 时返回 -1 errno=EINVAL.
+   * 用 prctl(CLEAR_ALL, 0,0,0,0) 当 sentinel:
+   *   KPM 装了 → kernel 走 clear_all_pages(), 返回 0
+   *   KPM 没装 → kernel 不识别 option, 返回 -1 errno=EINVAL
    */
   long ret;
+  int saved_errno;
+
   errno = 0;
   ret = syscall (__NR_prctl, GUM_TS_CLEAR_ALL_OPTION,
       (unsigned long) 0, (unsigned long) 0,
       (unsigned long) 0, (unsigned long) 0);
+  saved_errno = errno;
+  GUM_TS_LOGI ("[text_shadow] probe: prctl(0x%x, 0,0,0,0) = %ld errno=%d",
+      GUM_TS_CLEAR_ALL_OPTION, ret, saved_errno);
   if (ret == 0)
     return TRUE;
   return FALSE;
@@ -90,7 +96,11 @@ gum_ts_pool_chunk_new (gsize min_size)
   base = mmap (NULL, size, PROT_READ | PROT_WRITE,
       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED)
+  {
+    GUM_TS_LOGE ("[text_shadow] pool: mmap %zu bytes FAILED errno=%d",
+        size, errno);
     return NULL;
+  }
 
   chunk = g_slice_new (GumTsPoolChunk);
   chunk->base = (guint8 *) base;
@@ -98,6 +108,8 @@ gum_ts_pool_chunk_new (gsize min_size)
   chunk->offset = 0;
   chunk->next = NULL;
 
+  GUM_TS_LOGI ("[text_shadow] pool: new chunk base=%p size=0x%zx",
+      base, size);
   return chunk;
 }
 
@@ -135,6 +147,11 @@ gum_text_shadow_init (void)
   if (g_available)
   {
     g_saved_pages = g_hash_table_new (NULL, NULL);
+    GUM_TS_LOGI ("[text_shadow] init: KPM available, ready");
+  }
+  else
+  {
+    GUM_TS_LOGI ("[text_shadow] init: KPM not available, all APIs no-op");
   }
   g_initialized = TRUE;
 
@@ -168,6 +185,8 @@ gum_text_shadow_save_original_page (gconstpointer page)
   if (existing != NULL)
   {
     g_mutex_unlock (&g_lock);
+    GUM_TS_LOGI ("[text_shadow] save: page=%p (cached, buf=%p)",
+        page_aligned, existing);
     return existing;
   }
 
@@ -175,6 +194,8 @@ gum_text_shadow_save_original_page (gconstpointer page)
   if (buf == NULL)
   {
     g_mutex_unlock (&g_lock);
+    GUM_TS_LOGE ("[text_shadow] save: page=%p pool_alloc FAILED",
+        page_aligned);
     return NULL;
   }
 
@@ -187,6 +208,8 @@ gum_text_shadow_save_original_page (gconstpointer page)
 
   g_hash_table_insert (g_saved_pages, page_aligned, buf);
 
+  GUM_TS_LOGI ("[text_shadow] save: page=%p new buf=%p (first 4B=%02x %02x %02x %02x)",
+      page_aligned, buf, buf[0], buf[1], buf[2], buf[3]);
   g_mutex_unlock (&g_lock);
   return buf;
 }
@@ -197,6 +220,7 @@ gum_text_shadow_protect (gpointer func_addr)
   gpointer page_aligned;
   gpointer orig_buf;
   long ret;
+  int saved_errno;
 
   if (!g_available)
     return -1;
@@ -209,11 +233,27 @@ gum_text_shadow_protect (gpointer func_addr)
   g_mutex_unlock (&g_lock);
 
   if (orig_buf == NULL)
+  {
+    GUM_TS_LOGE ("[text_shadow] protect: func=%p page=%p MISSING orig_buf",
+        func_addr, page_aligned);
     return -1;
+  }
 
+  errno = 0;
   ret = syscall (__NR_prctl, GUM_TS_PROTECT_OPTION,
       (unsigned long) func_addr, (unsigned long) orig_buf,
       (unsigned long) 0, (unsigned long) 0);
+  saved_errno = errno;
+  if (ret == 0)
+  {
+    GUM_TS_LOGI ("[text_shadow] protect: func=%p page=%p orig=%p ok",
+        func_addr, page_aligned, orig_buf);
+  }
+  else
+  {
+    GUM_TS_LOGE ("[text_shadow] protect: func=%p page=%p orig=%p FAILED ret=%ld errno=%d",
+        func_addr, page_aligned, orig_buf, ret, saved_errno);
+  }
   return (int) ret;
 }
 
@@ -222,6 +262,7 @@ gum_text_shadow_unprotect (gpointer page)
 {
   gpointer page_aligned;
   long ret;
+  int saved_errno;
 
   if (!g_available)
     return -1;
@@ -229,9 +270,13 @@ gum_text_shadow_unprotect (gpointer page)
   page_aligned =
       (gpointer) ((guintptr) page & GUM_TS_PAGE_MASK);
 
+  errno = 0;
   ret = syscall (__NR_prctl, GUM_TS_UNPROTECT_OPTION,
       (unsigned long) page_aligned, (unsigned long) 0,
       (unsigned long) 0, (unsigned long) 0);
+  saved_errno = errno;
+  GUM_TS_LOGI ("[text_shadow] unprotect: page=%p ret=%ld errno=%d",
+      page_aligned, ret, saved_errno);
   return (int) ret;
 }
 
@@ -239,11 +284,15 @@ int
 gum_text_shadow_clear_all (void)
 {
   long ret;
+  int saved_errno;
   if (!g_available)
     return -1;
+  errno = 0;
   ret = syscall (__NR_prctl, GUM_TS_CLEAR_ALL_OPTION,
       (unsigned long) 0, (unsigned long) 0,
       (unsigned long) 0, (unsigned long) 0);
+  saved_errno = errno;
+  GUM_TS_LOGI ("[text_shadow] clear_all: ret=%ld errno=%d", ret, saved_errno);
   return (int) ret;
 }
 

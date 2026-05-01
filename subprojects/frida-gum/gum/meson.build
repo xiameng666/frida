@@ -1,6 +1,7 @@
 gnome = import('gnome')
 
 gum_headers = [
+  'gum-text-shadow.h',
   'gum.h',
   'gumapiresolver.h',
   'gumbacktracer.h',
@@ -43,6 +44,7 @@ gum_headers = [
 ]
 
 gum_sources = [
+  'gum-text-shadow.c',
   'gum.c',
   'gumapiresolver.c',
   'gumbacktracer.c',

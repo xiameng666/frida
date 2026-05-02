@@ -8,8 +8,6 @@
 # if __ANDROID_API__ < __ANDROID_API_L__
 #  include <signal.h>
 # endif
-extern int xiam_unlink_self (void);
-extern int xiam_unlink_self_delayed (void);
 #endif
 #ifdef HAVE_GIOOPENSSL
 # include <gioopenssl.h>
@@ -24,15 +22,6 @@ _frida_agent_environment_init (void)
   if (been_here)
     return;
   been_here = TRUE;
-#endif
-
-#ifdef HAVE_ANDROID
-  /* 自动摘链已禁用 — 实测在某些设备 (如 panther/d76b1349) 触发
-   * libart DlOpenOatFile 析构时 dlclose 走到我们改过的链表,
-   * linker soinfo_free 触发 "is not in soinfo_list (double unload?)"
-   * abort. 摘链需要外部脚本通过 xiam_unlink_self_delayed/xiam_unlink_self
-   * 手动调用 (导出符号仍然保留). */
-  /* (void)xiam_unlink_self_delayed (); */
 #endif
 
 #ifdef _MSC_VER

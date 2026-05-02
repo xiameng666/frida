@@ -1,1120 +1,560 @@
-/*
- * feature-scan.js  -  全量打印, 不过滤
- *
- * 注入后 REPL 直接调:
- *   all()        全跑
- *   status()
- *   cmdline()
- *   threads()
- *   maps()
- *   smaps()
- *   fds()
- *   unix()
- *   tmp([name])
- *
- *   hookDlopen() 已在脚本加载时自动调用
- */
+// feature-scan.js — 极简重写 (脚本不装任何 hook, 不做任何自动操作)
+//
+// REPL 函数:
+//   maps()        过滤 frida/xiam 痕迹的 /proc/self/maps
+//   mapsRaw()     全量 /proc/self/maps
+//   cmdline()     /proc/self/cmdline
+//   linkMap()     遍历 r_debug.r_map, 只打 xiam/memfd/frida 命中行
+//   unlinkProbe() 探测断链计划 (dry-run, 默认匹配 'xiam')
+//   unlinkDo()    真断链 (单向 forward, 2 个写)
 
 const PROC_SELF = '/proc/self';
 
-// ---------------- libc 直读 ----------------
-const libc = Process.getModuleByName('libc.so');
-function exp(name) {
-  const a = libc.findExportByName(name);
-  if (a !== null) return a;
-  try {
-    return Module.getGlobalExportByName(name);
-  } catch (e) {
-    return null;
-  }
-}
+// procfs 文件 size=0, File.readBytes() 一次 short-read 就 EOF, 拿不到内容.
+// 用 read syscall 循环读到 EOF.
+const _open  = new NativeFunction(Module.getGlobalExportByName('open'),  'int',  ['pointer', 'int']);
+const _read  = new NativeFunction(Module.getGlobalExportByName('read'),  'long', ['int', 'pointer', 'ulong']);
+const _close = new NativeFunction(Module.getGlobalExportByName('close'), 'int',  ['int']);
 
-// 从主程序的 PT_DYNAMIC 里找 DT_DEBUG, 该 entry 的 d_un.d_ptr 指向 r_debug.
-// 这是 gdb / lldb / 风控的标准路径, 不依赖 _r_debug 符号是否导出.
-//
-// 实现: dl_iterate_phdr 遍历每个加载模块, 对每个模块找 PT_DYNAMIC, 然后
-//       在 PT_DYNAMIC 里找 DT_DEBUG.d_un.d_ptr != NULL. 命中即返回.
-//       (DT_DEBUG 仅主程序有, 普通 so 没有这个 entry)
-function findRDebugViaDtDebug() {
-  const sym = exp('dl_iterate_phdr');
-  if (sym === null) return null;
-  const dl_iterate_phdr = new NativeFunction(sym, 'int', ['pointer', 'pointer']);
-
-  const PT_DYNAMIC = 2;
-  const DT_NULL = 0, DT_DEBUG = 21;
-  let foundRDebug = null;
-  let trace = [];
-
-  const cb = new NativeCallback(function (info, size, data) {
-    if (foundRDebug !== null) return 1;
-    let dlpi_addr, dlpi_name, dlpi_phdr, dlpi_phnum;
-    try {
-      dlpi_addr  = info.readPointer();
-      dlpi_name  = info.add(8).readPointer();
-      dlpi_phdr  = info.add(16).readPointer();
-      dlpi_phnum = info.add(24).readU16();
-    } catch (e) { return 0; }
-
-    const name = dlpi_name.isNull() ? '<null>' : dlpi_name.readCString();
-    if (dlpi_phdr.isNull() || dlpi_phnum === 0) return 0;
-
-    // 找 PT_DYNAMIC. Phdr64 字段:
-    //   type(4) flags(4) offset(8) vaddr(8) paddr(8) filesz(8) memsz(8) align(8) = 56B
-    let dynVaddr = null;
-    for (let i = 0; i < dlpi_phnum; i++) {
-      const ph = dlpi_phdr.add(i * 56);
-      if (ph.readU32() === PT_DYNAMIC) {
-        dynVaddr = ph.add(16).readPointer();
-        break;
-      }
+function _slurp(path) {
+    const fd = _open(Memory.allocUtf8String(path), 0);
+    if (fd < 0) return '';
+    const sz = 8192;
+    const buf = Memory.alloc(sz);
+    let out = '';
+    while (true) {
+        const n = _read(fd, buf, sz).valueOf();
+        if (n <= 0) break;
+        const u8 = new Uint8Array(buf.readByteArray(n));
+        let s = '';
+        for (let i = 0; i < n; i++) s += String.fromCharCode(u8[i]);
+        out += s;
     }
-    if (dynVaddr === null) return 0;
-
-    // PT_DYNAMIC.runtime_base = dlpi_addr + p_vaddr
-    const dynRuntime = dlpi_addr.add(dynVaddr);
-
-    // ElfW(Dyn) 64-bit: d_tag(8) d_un(8) = 16B, 直到 DT_NULL 终止
-    let p = dynRuntime;
-    for (let i = 0; i < 8192; i++) {
-      let tag, val;
-      try {
-        tag = p.readU64().valueOf();
-        val = p.add(8).readPointer();
-      } catch (e) { break; }
-      if (tag === DT_NULL) break;
-      if (tag === DT_DEBUG) {
-        trace.push(`  [DT_DEBUG] at ${dynRuntime.add(i*16)} in ${name || '<unnamed>'} -> ${val}`);
-        if (!val.isNull()) {
-          foundRDebug = val;
-          return 1;
-        }
-      }
-      p = p.add(16);
-    }
-    return 0;
-  }, 'int', ['pointer', 'ulong', 'pointer']);
-
-  dl_iterate_phdr(cb, NULL);
-
-  if (trace.length) console.log('[DT_DEBUG search]\n' + trace.join('\n'));
-  return foundRDebug;
+    _close(fd);
+    return out;
 }
 
-const _open    = new NativeFunction(exp('open'),    'int',     ['pointer', 'int']);
-const _read    = new NativeFunction(exp('read'),    'long',    ['int', 'pointer', 'ulong']);
-const _close   = new NativeFunction(exp('close'),   'int',     ['int']);
-const _opendir = new NativeFunction(exp('opendir'), 'pointer', ['pointer']);
-const _readdir = new NativeFunction(exp('readdir'), 'pointer', ['pointer']);
-const _closedir= new NativeFunction(exp('closedir'),'int',     ['pointer']);
-const _readlink= new NativeFunction(exp('readlink'),'long',    ['pointer', 'pointer', 'ulong']);
-
-// 把 /proc 文件按字节读完, 再逐字节拼成字符串, 不依赖 readUtf8String
-// 注意: /proc 伪文件 read 可能返回小于请求量却还有数据, 必须 read 到 EOF (n==0)
-function readAll(path) {
-  const fd = _open(Memory.allocUtf8String(path), 0).valueOf();
-  if (fd < 0) return `<open failed: ${path}>`;
-  const CHUNK = 65536;
-  const buf = Memory.alloc(CHUNK);
-  const parts = [];
-  while (true) {
-    const n = _read(fd, buf, CHUNK).valueOf();
-    if (n <= 0) break;
-    const arr = new Uint8Array(ArrayBuffer.wrap(buf, n));
-    let s = '';
-    for (let i = 0; i < n; i++) s += String.fromCharCode(arr[i]);
-    parts.push(s);
-  }
-  _close(fd);
-  return parts.join('');
-}
-
-function readDir(path) {
-  const out = [];
-  const dir = _opendir(Memory.allocUtf8String(path));
-  if (dir.isNull()) return out;
-  while (true) {
-    const ent = _readdir(dir);
-    if (ent.isNull()) break;
-    // bionic dirent: ino(8) off(8) reclen(2) type(1) name[]
-    const name = ent.add(19).readUtf8String();
-    if (name === '.' || name === '..') continue;
-    out.push(name);
-  }
-  _closedir(dir);
-  return out;
-}
-
-function readLink(path) {
-  const buf = Memory.alloc(1024);
-  const n = _readlink(Memory.allocUtf8String(path), buf, 1023).valueOf();
-  if (n <= 0) return null;
-  buf.add(n).writeU8(0);
-  return buf.readUtf8String();
-}
-
-function dump(title, body) {
-  console.log('\n========== ' + title + ' ==========');
-  console.log(body && body.length ? body : '<empty>');
-  console.log('========== end ' + title + ' ==========\n');
-}
-
-// ---------------- RPC + globals ----------------
-function status() {
-  dump('/proc/self/status', readAll(`${PROC_SELF}/status`));
-}
-
-function cmdline() {
-  let s = readAll(`${PROC_SELF}/cmdline`);
-  s = s.replace(/\0/g, ' ');
-  dump('/proc/self/cmdline', s);
-}
-
-// 默认 maps(): 只看关心的库 (libc / libart / libandroid_runtime / 含 xiam)
-// 想看完整 maps 用 mapsRaw()
+// ── 1) maps ─────────────────────────────────────────────────────────────────
 function maps() {
-  const txt = readAll(`${PROC_SELF}/maps`);
-  const re = /(libc\.so|libart\.so|libandroid_runtime\.so|xiam)/i;
-  const out = txt.split('\n').filter(line => re.test(line));
-  dump('/proc/self/maps  filter=[libc | libart | libandroid_runtime | xiam]',
-       out.join('\n') + `\n---- ${out.length} lines ----`);
+    const txt = _slurp(PROC_SELF + '/maps');
+    const re = /(libc\.so|libart\.so|libandroid_runtime\.so|\/linker(64)?\b|xiam|memfd:|frida)/i;
+    const lines = txt.split('\n').filter(l => re.test(l));
+    console.log('=== /proc/self/maps  filter=[libc|libart|libandroid_runtime|linker|xiam|memfd|frida] ===');
+    console.log(lines.join('\n'));
+    console.log(`---- ${lines.length} lines (total ${txt.split('\n').length}) ----`);
 }
 
 function mapsRaw() {
-  const txt = readAll(`${PROC_SELF}/maps`);
-  const total = txt.split('\n').length;
-  dump(`/proc/self/maps  FULL  (${total} lines, ${txt.length} bytes)`, txt);
+    console.log(_slurp(PROC_SELF + '/maps'));
 }
 
-function smaps() {
-  const txt = readAll(`${PROC_SELF}/smaps`);
-  dump(`/proc/self/smaps  FULL  (${txt.length} bytes)`, txt);
+// ── 2) cmdline ──────────────────────────────────────────────────────────────
+function cmdline() {
+    const s = _slurp(PROC_SELF + '/cmdline').replace(/\0/g, ' ').trim();
+    console.log('cmdline:', s);
 }
 
-// smaps 过滤: 同样只看 libc / libart / libandroid_runtime / xiam 的段
-// smaps 一段是多行 (Size/Rss/...), 用空行分段, 命中关键词的整段保留
-function smapsFilt() {
-  const txt = readAll(`${PROC_SELF}/smaps`);
-  const re = /(libc\.so|libart\.so|libandroid_runtime\.so|xiam)/i;
-  const segs = [];
-  let cur = [];
-  txt.split('\n').forEach(line => {
-    if (/^[0-9a-f]+-[0-9a-f]+ /i.test(line)) {
-      if (cur.length) segs.push(cur);
-      cur = [line];
-    } else {
-      cur.push(line);
-    }
-  });
-  if (cur.length) segs.push(cur);
-  const kept = segs.filter(seg => re.test(seg[0]));
-  const body = kept.map(seg => seg.join('\n')).join('\n');
-  dump('/proc/self/smaps  filter=[libc | libart | libandroid_runtime | xiam]',
-       body + `\n---- ${kept.length} segments ----`);
-}
-
-function threads() {
-  const tids = readDir(`${PROC_SELF}/task`);
-  tids.sort((a, b) => parseInt(a) - parseInt(b));
-  const lines = ['[tid]    comm'];
-  tids.forEach(tid => {
-    const comm = readAll(`${PROC_SELF}/task/${tid}/comm`).replace(/\n$/, '');
-    lines.push(`${tid.padStart(7)}  ${comm}`);
-  });
-  dump('/proc/self/task/*/comm', lines.join('\n'));
-}
-
-function fds() {
-  const fdList = readDir(`${PROC_SELF}/fd`);
-  fdList.sort((a, b) => parseInt(a) - parseInt(b));
-  const lines = ['[fd]  ->  target'];
-  fdList.forEach(fd => {
-    const t = readLink(`${PROC_SELF}/fd/${fd}`) || '<readlink failed>';
-    lines.push(`${fd.padStart(4)}  ->  ${t}`);
-  });
-  dump('/proc/self/fd', lines.join('\n'));
-}
-
-function unix() {
-  dump('/proc/net/unix', readAll('/proc/net/unix'));
-}
-
-function tmp(name) {
-  name = name || 'xiam-data';
-  const lines = [];
-  const roots = [
-    '/data/local/tmp',
-    '/data/local/tmp/' + name,
-    '/data/local/tmp/re.frida.server',
-    '/sdcard/' + name,
-    '/tmp/' + name,
-  ];
-  roots.forEach(d => {
-    try {
-      const items = readDir(d);
-      lines.push(`\n${d}/  (${items.length} entries)`);
-      items.forEach(it => lines.push('  ' + it));
-      items.forEach(it => {
-        const sub = `${d}/${it}`;
-        try {
-          const inner = readDir(sub);
-          if (inner.length) {
-            lines.push(`  ${sub}/`);
-            inner.forEach(i2 => lines.push('    ' + i2));
-          }
-        } catch (e) {}
-      });
-    } catch (e) {
-      lines.push(`\n${d}/  <missing>`);
-    }
-  });
-  dump('tmp dirs (looking for "' + name + '")', lines.join('\n'));
-}
-
-function all() {
-  status();
-  cmdline();
-  threads();
-  maps();
-  smaps();
-  fds();
-  unix();
-  tmp();
-}
-
-// ---------------- detect: 模拟反 frida 检测器, 一把扫所有可疑特征 ----------------
-// 5 个维度: maps/rwxp, 线程名, dl_iterate_phdr+r_debug, fd readlink, 知名端口
-// 强特征 (基本判定 frida 在场) 和弱特征 (glib 内置, 相关) 分开标
-const _DETECT_STRONG = /xiam|\bfrida\b|frida-agent|frida-gadget|frida-server|frida-helper|gum-(?!error-quark)|gum_|re\.frida|\/memfd:xiam|\/memfd:frida/i;
-const _DETECT_WEAK   = /^(gmain|gdbus|pool-spawner|pool-%s|gjs|gio[-:]|glib-)/i;
-
-function _detectMaps() {
-  console.log('\n----- [1] /proc/self/maps -----');
-  const txt = readAll(`${PROC_SELF}/maps`);
-  const lines = txt.split('\n');
-  const rwxpAnon = [], rwxpHooked = [], featAnonName = [], featPath = [], memfdOther = [];
-
-  lines.forEach(line => {
-    if (line.length === 0) return;
-    const m = line.match(/^([0-9a-f]+)-([0-9a-f]+) (\S{4}) \S+ \S+ \S+\s*(.*)$/i);
-    if (!m) return;
-    const [, , , perm, rest] = m;
-    const path = rest.trim();
-
-    if (perm === 'rwxp') {
-      if (path === '' || path.startsWith('[anon:')) rwxpAnon.push(line);
-      else if (!path.startsWith('[stack') && path !== '[heap]') rwxpHooked.push(line);
-    }
-    if (/\[anon:.*?(xiam|frida|gum-)/i.test(line)) featAnonName.push(line);
-    if (path.startsWith('/memfd:')) {
-      if (_DETECT_STRONG.test(path)) featPath.push(line);
-      else memfdOther.push(line);
-    } else if (_DETECT_STRONG.test(path)) {
-      featPath.push(line);
-    }
-  });
-
-  let hits = 0;
-  function blk(title, arr, sev) {
-    if (arr.length === 0) { console.log(`  [${sev}] ${title}: 0`); return; }
-    console.log(`  [${sev}] ${title}: ${arr.length}`);
-    arr.forEach(l => console.log('       ' + l));
-    if (sev === '!!') hits += arr.length;
-  }
-  blk('rwxp 匿名段 (gum 跳板池, 强特征)', rwxpAnon, '!!');
-  blk('rwxp 文件段 (frida hook 后撕段)', rwxpHooked, '!!');
-  blk('[anon:xiam/frida/gum-*] 命名段', featAnonName, '!!');
-  blk('/memfd:xiam-/frida- 路径', featPath, '!!');
-  blk('其它 /memfd:* (非 frida 也可能用)', memfdOther, ' ?');
-  console.log(`  ---- maps 强特征命中: ${hits} ----`);
-  return hits;
-}
-
-function _detectThreads() {
-  console.log('\n----- [2] /proc/self/task/*/comm -----');
-  const tids = readDir(`${PROC_SELF}/task`);
-  const strong = [], weak = [];
-  tids.forEach(tid => {
-    const comm = readAll(`${PROC_SELF}/task/${tid}/comm`).replace(/\n$/, '');
-    const line = `tid=${tid.padStart(6)}  ${comm}`;
-    if (_DETECT_STRONG.test(comm)) strong.push(line);
-    else if (_DETECT_WEAK.test(comm)) weak.push(line);
-  });
-  if (strong.length === 0 && weak.length === 0) console.log('  [OK] 无可疑线程名');
-  if (strong.length) {
-    console.log(`  [!!] 强特征 (xiam/frida/gum-): ${strong.length}`);
-    strong.forEach(l => console.log('       ' + l));
-  }
-  if (weak.length) {
-    console.log(`  [ ?] glib 线程 (gmain/gdbus/pool-*): ${weak.length}`);
-    weak.forEach(l => console.log('       ' + l));
-  }
-  console.log(`  ---- 线程总数: ${tids.length}, 强特征: ${strong.length}, 弱特征: ${weak.length} ----`);
-  return strong.length;
-}
-
-function _detectSo() {
-  console.log('\n----- [3] dl_iterate_phdr + r_debug -----');
-  const dlSym = exp('dl_iterate_phdr');
-  if (dlSym === null) { console.log('  [skip] dl_iterate_phdr 不可用'); return 0; }
-  const dl_iterate_phdr = new NativeFunction(dlSym, 'int', ['pointer', 'pointer']);
-
-  const dlAll = [], dlHits = [];
-  const cb = new NativeCallback(function (info, size, data) {
-    const addr = info.readPointer();
-    const namePtr = info.add(8).readPointer();
-    const name = namePtr.isNull() ? '' : namePtr.readCString();
-    const line = `${addr.toString().padEnd(18)} ${name}`;
-    dlAll.push(line);
-    if (_DETECT_STRONG.test(name)) dlHits.push(line);
-    return 0;
-  }, 'int', ['pointer', 'ulong', 'pointer']);
-  dl_iterate_phdr(cb, NULL);
-  console.log(`  [dl_iterate_phdr] 总=${dlAll.length}, 强特征=${dlHits.length}`);
-  if (dlHits.length) {
-    console.log('  [!!] 命中:');
-    dlHits.forEach(l => console.log('       ' + l));
-  } else {
-    console.log('  [OK] dl_iterate_phdr 无 frida/xiam');
-  }
-
-  // r_debug via DT_DEBUG
-  const PT_DYNAMIC = 2, DT_NULL = 0, DT_DEBUG = 21;
-  let rDebugAddr = null;
-  const cb2 = new NativeCallback(function (info, size, data) {
-    if (rDebugAddr) return 1;
-    const dlpi_addr = info.readPointer();
-    const dlpi_phdr = info.add(16).readPointer();
-    const dlpi_phnum = info.add(24).readU16();
-    if (dlpi_phdr.isNull() || dlpi_phnum === 0) return 0;
-    let dynVaddr = null;
-    for (let i = 0; i < dlpi_phnum; i++) {
-      const ph = dlpi_phdr.add(i * 56);
-      if (ph.readU32() === PT_DYNAMIC) { dynVaddr = ph.add(16).readPointer(); break; }
-    }
-    if (dynVaddr === null) return 0;
-    let p = dlpi_addr.add(dynVaddr);
-    for (let i = 0; i < 8192; i++) {
-      let tag, val;
-      try { tag = p.readU64().valueOf(); val = p.add(8).readPointer(); }
-      catch (e) { break; }
-      if (tag === DT_NULL) break;
-      if (tag === DT_DEBUG && !val.isNull()) { rDebugAddr = val; return 1; }
-      p = p.add(16);
-    }
-    return 0;
-  }, 'int', ['pointer', 'ulong', 'pointer']);
-  dl_iterate_phdr(cb2, NULL);
-
-  let rHitsLen = 0;
-  if (rDebugAddr === null) {
-    console.log('  [r_debug] 找不到 (无 DT_DEBUG)');
-  } else {
-    console.log(`  [r_debug] @ ${rDebugAddr}`);
-    let cur = rDebugAddr.add(8).readPointer();
-    let total = 0; const rHits = [];
-    while (!cur.isNull() && total < 1024) {
-      const l_addr = cur.readPointer();
-      const l_namePtr = cur.add(8).readPointer();
-      const l_name = l_namePtr.isNull() ? '' : l_namePtr.readCString();
-      const line = `${l_addr.toString().padEnd(18)} ${l_name}`;
-      if (_DETECT_STRONG.test(l_name)) rHits.push(line);
-      cur = cur.add(24).readPointer();
-      total++;
-    }
-    console.log(`  [r_debug] 总=${total}, 强特征=${rHits.length}`);
-    if (rHits.length) {
-      console.log('  [!!] 命中:');
-      rHits.forEach(l => console.log('       ' + l));
-    } else {
-      console.log('  [OK] r_debug 无 frida/xiam');
-    }
-    rHitsLen = rHits.length;
-  }
-  return dlHits.length + rHitsLen;
-}
-
-function _detectFds() {
-  console.log('\n----- [4] /proc/self/fd -----');
-  const _readlink = new NativeFunction(exp('readlink'), 'long', ['pointer', 'pointer', 'ulong']);
-  const fdList = readDir(`${PROC_SELF}/fd`);
-  const buf = Memory.alloc(1024);
-  const hits = [], memfdOthers = [];
-  fdList.forEach(fd => {
-    const path = `${PROC_SELF}/fd/${fd}`;
-    const n = _readlink(Memory.allocUtf8String(path), buf, 1023).valueOf();
-    if (n <= 0) return;
-    buf.add(n).writeU8(0);
-    const target = buf.readUtf8String();
-    if (_DETECT_STRONG.test(target)) hits.push(`fd=${fd.padStart(4)} -> ${target}`);
-    else if (target.startsWith('/memfd:')) memfdOthers.push(`fd=${fd.padStart(4)} -> ${target}`);
-  });
-  if (hits.length === 0) console.log('  [OK] 无 frida/xiam fd');
-  else { console.log(`  [!!] 命中 ${hits.length}:`); hits.forEach(l => console.log('       ' + l)); }
-  if (memfdOthers.length) {
-    console.log(`  [ ?] 其它 memfd ${memfdOthers.length}:`);
-    memfdOthers.forEach(l => console.log('       ' + l));
-  }
-  return hits.length;
-}
-
-// 走 r_debug.r_map, 对 l_name 与 DT_SONAME 双字段做子串匹配,
-// 命中即视为可被风控识别 (与 dpx 视角等同, 但不依赖具体厂商).
-function _detectLinkMap() {
-  console.log('\n----- [6] r_debug.r_map + DT_SONAME -----');
-
-  // 找 r_debug
-  let r_debug = exp('_r_debug');
-  if (r_debug === null) {
-    for (const ln of ['linker64', 'linker', 'ld-android.so']) {
-      try {
-        const m = Process.getModuleByName(ln);
-        r_debug = m.findExportByName('_r_debug') || m.findExportByName('__dl__r_debug');
-        if (r_debug) break;
-      } catch (e) {}
-    }
-  }
-  if (r_debug === null) r_debug = findRDebugViaDtDebug();
-  if (!r_debug || r_debug.isNull()) {
-    console.log('  [skip] r_debug 找不到');
-    return 0;
-  }
-
-  const DT_NULL = 0, DT_STRTAB = 5, DT_STRSZ = 10, DT_SONAME = 14;
-  const HIT_LNAME  = ['frida', '/memfd:', 'jvmti.so', 'jdwp.so'];
-  const HIT_SONAME = ['frida', '-agent-raw.so'];
-
-  let total = 0, hits = [];
-  let cur = r_debug.add(8).readPointer();
-  while (!cur.isNull() && total < 1024) {
-    let l_addr, l_name_ptr, l_ld, l_next, l_name;
-    try {
-      l_addr     = cur.readPointer();
-      l_name_ptr = cur.add(8).readPointer();
-      l_ld       = cur.add(16).readPointer();
-      l_next     = cur.add(24).readPointer();
-      l_name     = l_name_ptr.isNull() ? '' : (l_name_ptr.readCString() || '');
-    } catch (e) { break; }
-
-    let soname = '';
-    try {
-      if (!l_ld.isNull()) {
-        let strtab = NULL, strsz = 0, soname_off = -1;
-        let p = l_ld;
-        for (let i = 0; i < 4096; i++) {
-          const tag = p.readU64().valueOf();
-          if (tag === DT_NULL) break;
-          if (tag === DT_STRTAB)      strtab = p.add(8).readPointer();
-          else if (tag === DT_STRSZ)  strsz = p.add(8).readU64().valueOf();
-          else if (tag === DT_SONAME) soname_off = p.add(8).readU64().valueOf();
-          p = p.add(16);
+// ── 3) linkMap: 走 r_debug.r_map, 只打可疑 ──────────────────────────────────
+function _findRDebugViaDtDebug() {
+    const exe = Process.enumerateModules()[0];
+    const phoff   = exe.base.add(0x20).readU64();
+    const phentsz = exe.base.add(0x36).readU16();
+    const phnum   = exe.base.add(0x38).readU16();
+    const phdrs   = exe.base.add(parseInt(phoff.toString()));
+    for (let i = 0; i < phnum; i++) {
+        const ph = phdrs.add(i * phentsz);
+        if (ph.readU32() !== 2) continue;   // PT_DYNAMIC
+        const dynVA = ph.add(16).readU64();
+        const dyn = exe.base.add(parseInt(dynVA.toString()));
+        for (let j = 0; j < 4096; j++) {
+            const e = dyn.add(j * 16);
+            const tag = parseInt(e.readU64().toString());
+            if (tag === 0) return null;
+            if (tag === 21) {   // DT_DEBUG
+                return e.add(8).readPointer();
+            }
         }
-        if (!strtab.isNull() && soname_off >= 0 && soname_off < strsz + 1024) {
-          try { soname = strtab.add(soname_off).readCString() || ''; } catch (e) {}
-          if (soname === '' && !l_addr.isNull()) {
-            try { soname = l_addr.add(strtab).add(soname_off).readCString() || ''; } catch (e) {}
-          }
-        }
-      }
-    } catch (e) {}
-
-    let why = [];
-    for (const k of HIT_LNAME)  if (l_name.indexOf(k)  !== -1) why.push(`l_name~${k}`);
-    for (const k of HIT_SONAME) if (soname.indexOf(k) !== -1) why.push(`SONAME~${k}`);
-    if (why.length) {
-      hits.push(`${l_addr.toString().padEnd(18)} ${(l_name || '<null>').padEnd(46)} ${soname}    [${why.join(',')}]`);
+        return null;
     }
-
-    cur = l_next;
-    total++;
-  }
-
-  if (hits.length === 0) {
-    console.log(`  [OK] link_map 总=${total}, 无命中`);
-  } else {
-    console.log(`  [!!] link_map 总=${total}, 命中=${hits.length}:`);
-    hits.forEach(l => console.log('       ' + l));
-  }
-  return hits.length;
+    return null;
 }
 
-function _detectPorts() {
-  console.log('\n----- [5] /proc/net/tcp[6] (frida 知名端口) -----');
-  const KNOWN = [27042, 27043, 27052, 27053, 14725, 14735];
-  const txt = readAll('/proc/net/tcp6') + '\n' + readAll('/proc/net/tcp');
-  const hits = [];
-  txt.split('\n').forEach(line => {
-    const m = line.match(/^\s*\d+:\s+\S+:([0-9A-F]{4})\s/);
-    if (!m) return;
-    const port = parseInt(m[1], 16);
-    if (KNOWN.indexOf(port) !== -1) hits.push(`port=${port}  ${line.trim()}`);
-  });
-  if (hits.length === 0) console.log('  [OK] 无 frida 知名端口');
-  else { console.log(`  [!!] 命中 ${hits.length}:`); hits.forEach(l => console.log('       ' + l)); }
-  return hits.length;
-}
-
-function detect() {
-  console.log('\n############################################');
-  console.log('# anti-frida feature scan');
-  console.log(`# pid=${Process.id}, arch=${Process.arch}, os=${Process.platform}`);
-  console.log('############################################');
-  const m = _detectMaps();
-  const t = _detectThreads();
-  const s = _detectSo();
-  const f = _detectFds();
-  const p = _detectPorts();
-  const d = _detectLinkMap();
-  const total = m + t + s + f + p + d;
-  console.log('\n========== SUMMARY ==========');
-  console.log(`  maps   强特征:        ${m}`);
-  console.log(`  thread 强特征:        ${t}`);
-  console.log(`  so 链表强特征:        ${s}`);
-  console.log(`  fd     强特征:        ${f}`);
-  console.log(`  ports  命中:          ${p}`);
-  console.log(`  link_map 命中:        ${d}    (l_name + DT_SONAME 双字段)`);
-  console.log(total === 0
-    ? '\n  [PASS] 当前进程未被检出 frida 特征'
-    : `\n  [FAIL] 共 ${total} 处特征命中, 风控可识别 frida`);
-}
-// detect 子模块用法: detect.maps() / detect.threads() / detect.so() / detect.fds() / detect.ports() / detect.linkMap()
-detect.maps    = _detectMaps;
-detect.threads = _detectThreads;
-detect.so      = _detectSo;
-detect.fds     = _detectFds;
-detect.ports   = _detectPorts;
-detect.linkMap = _detectLinkMap;
-
-// ---------------- dl_iterate_phdr 遍历 ----------------
-// 这是公开 API, 风控最常用. 标准 glibc/bionic 都有.
-// 原型: int dl_iterate_phdr(int (*cb)(struct dl_phdr_info *info, size_t size, void *data), void *data)
-// dl_phdr_info: addr(8) name(8) phdr(8) phnum(2) ...
-function dlIter() {
-  const sym = exp('dl_iterate_phdr');
-  if (sym === null) {
-    console.log('[dl_iter] dl_iterate_phdr not found');
-    return;
-  }
-  const dl_iterate_phdr = new NativeFunction(sym, 'int', ['pointer', 'pointer']);
-
-  const lines = ['[idx]  base               name'];
-  let idx = 0;
-  const cb = new NativeCallback(function (info, size, data) {
-    const addr = info.readPointer();
-    const namePtr = info.add(8).readPointer();
-    const name = namePtr.isNull() ? '<null>' : namePtr.readCString();
-    lines.push(`${String(idx).padStart(5)}  ${addr.toString().padEnd(18)} ${name}`);
-    idx++;
-    return 0;
-  }, 'int', ['pointer', 'ulong', 'pointer']);
-
-  dl_iterate_phdr(cb, NULL);
-  dump('dl_iterate_phdr (公开 API)', lines.join('\n') + `\n---- ${idx} entries ----`);
-}
-
-// ---------------- r_debug.r_map (link_map 链表) ----------------
-// _r_debug 是 dynamic linker 维护的全局结构, gdb/lldb 也是用它来枚举模块.
-// struct r_debug { int r_version; struct link_map *r_map; ... };
-// struct link_map { ElfW(Addr) l_addr; char *l_name; ElfW(Dyn) *l_ld; struct link_map *l_next; struct link_map *l_prev; };
-function rDebug() {
-  // 三路找 r_debug 地址 (任一命中即可):
-  //   1) libc / 全局符号 _r_debug   (glibc 上通常导出, bionic 上多半没有)
-  //   2) linker64 / linker / ld-android.so 里的 _r_debug 或 __dl__r_debug
-  //   3) 主程序 PT_DYNAMIC 的 DT_DEBUG entry (这是 gdb/lldb/风控的标准路径, 永远可用)
-  let sym = exp('_r_debug');
-  let how = sym ? 'libc/global _r_debug' : null;
-  if (sym === null) {
-    for (const ln of ['linker64', 'linker', 'ld-android.so']) {
-      try {
-        const m = Process.getModuleByName(ln);
-        sym = m.findExportByName('_r_debug');
-        if (sym) { how = ln + '!_r_debug'; break; }
-        sym = m.findExportByName('__dl__r_debug');
-        if (sym) { how = ln + '!__dl__r_debug'; break; }
-      } catch (e) {}
-    }
-  }
-  if (sym === null) {
-    sym = findRDebugViaDtDebug();
-    if (sym) how = 'PT_DYNAMIC/DT_DEBUG';
-  }
-  if (sym === null || sym.isNull()) {
-    dump('_r_debug walk', '<找不到 r_debug 地址 (DT_DEBUG/符号都没)>');
-    return;
-  }
-
-  const r_version = sym.readS32();
-  const r_map = sym.add(8).readPointer();
-  const lines = [`r_debug @ ${sym}  (via ${how})  r_version=${r_version}  r_map=${r_map}`];
-  lines.push('[idx]  l_addr            l_name                                                  l_ld              l_next');
-
-  let cur = r_map;
-  let idx = 0;
-  while (!cur.isNull() && idx < 1024) {
-    const l_addr = cur.readPointer();
-    const l_name = cur.add(8).readPointer();
-    const name = l_name.isNull() ? '<null>' : l_name.readCString();
-    const l_ld   = cur.add(16).readPointer();
-    const l_next = cur.add(24).readPointer();
-    lines.push(
-      `${String(idx).padStart(5)}  ${l_addr.toString().padEnd(18)}` +
-      `${(name || '').padEnd(56)}  ${l_ld.toString().padEnd(18)}${l_next}`
-    );
-    cur = l_next;
-    idx++;
-  }
-  dump('_r_debug.r_map (link_map 链表, gdb/风控都看这个)',
-       lines.join('\n') + `\n---- ${idx} entries ----`);
-}
-
-// ---------------- link_map 链表 + DT_SONAME ----------------
-// 走 r_debug.r_map 拿到链表头, 沿 l_next 遍历每个 link_map, 对每个 DSO:
-//   1) 检查 l_name (路径字符串) 是否含子串: frida / /memfd: / jvmti.so / jdwp.so
-//   2) 走 l_ld (PT_DYNAMIC) 找 DT_STRTAB / DT_STRSZ / DT_SONAME, 取 SONAME 字符串
-//      检查 SONAME 是否含: frida / -agent-raw.so
-// 这是常见风控的检测路径, 命中通常意味着进程被 SIGKILL.
-// 我们自己跑这套, 看看 frida agent 的 l_name + SONAME 各是什么, 验证改名是否到位.
 function linkMap() {
-  // 三路找 r_debug 地址 (与 rDebug() 共用同一套兜底)
-  let r_debug = exp('_r_debug');
-  let how = r_debug ? 'libc/global _r_debug' : null;
-  if (r_debug === null) {
-    for (const ln of ['linker64', 'linker', 'ld-android.so']) {
-      try {
-        const m = Process.getModuleByName(ln);
-        r_debug = m.findExportByName('_r_debug');
-        if (r_debug) { how = ln + '!_r_debug'; break; }
-        r_debug = m.findExportByName('__dl__r_debug');
-        if (r_debug) { how = ln + '!__dl__r_debug'; break; }
-      } catch (e) {}
-    }
-  }
-  if (r_debug === null) {
-    r_debug = findRDebugViaDtDebug();
-    if (r_debug) how = 'PT_DYNAMIC/DT_DEBUG';
-  }
-  if (!r_debug || r_debug.isNull()) {
-    dump('link_map walk', '<找不到 r_debug>');
-    return;
-  }
-
-  const lines = [`r_debug @ ${r_debug}  (via ${how})  r_version=${r_debug.readS32()}  r_map=${r_debug.add(8).readPointer()}`];
-  lines.push('');
-  lines.push('[idx]  l_addr            l_name                                          DT_SONAME');
-  lines.push('-----  ----------------  ----------------------------------------------  --------------------------');
-
-  const DT_NULL = 0, DT_STRTAB = 5, DT_STRSZ = 10, DT_SONAME = 14;
-
-  // dexprotect 子串黑名单 (来自 dpx_link_map_soname_blacklist):
-  const HIT_LNAME = [
-    'frida',          // l_name 含 frida 即杀
-    '/memfd:',        // l_name 以 /memfd: 开头即杀  <- 关键!
-    'jvmti.so',
-    'jdwp.so',
-  ];
-  const HIT_SONAME = [
-    'frida',
-    '-agent-raw.so',  // 包括老的 libfrida-agent-raw.so   <- 关键!
-  ];
-
-  let idx = 0, hits = 0;
-  let cur = r_debug.add(8).readPointer();   // r_debug.r_map -> 第一个 link_map
-
-  while (!cur.isNull() && idx < 1024) {
-    let l_addr, l_name_ptr, l_ld, l_next, l_name;
-    try {
-      l_addr     = cur.readPointer();
-      l_name_ptr = cur.add(8).readPointer();
-      l_ld       = cur.add(16).readPointer();
-      l_next     = cur.add(24).readPointer();
-      l_name     = l_name_ptr.isNull() ? '' : (l_name_ptr.readCString() || '');
-    } catch (e) {
-      lines.push(`${String(idx).padStart(5)}  <read error at ${cur}: ${e.message}>`);
-      break;
-    }
-
-    // 走 l_ld (PT_DYNAMIC) 找 SONAME
-    let soname = '';
-    try {
-      if (!l_ld.isNull()) {
-        let strtab = NULL, strsz = 0, soname_off = -1;
-        let p = l_ld;
-        for (let i = 0; i < 4096; i++) {
-          const tag = p.readU64().valueOf();
-          if (tag === DT_NULL) break;
-          if (tag === DT_STRTAB) {
-            const v = p.add(8).readPointer();
-            // bionic 在加载时已经把 DT_STRTAB 的 d_ptr 改写成绝对地址
-            strtab = v;
-          } else if (tag === DT_STRSZ) {
-            strsz = p.add(8).readU64().valueOf();
-          } else if (tag === DT_SONAME) {
-            soname_off = p.add(8).readU64().valueOf();
-          }
-          p = p.add(16);
+    const rd = _findRDebugViaDtDebug();
+    if (!rd || rd.isNull()) { console.log('r_debug not found'); return; }
+    console.log('r_debug @', rd);
+    let lm = rd.add(8).readPointer();   // r_debug.r_map
+    let idx = 0, hits = 0;
+    while (!lm.isNull() && idx < 1024) {
+        let name = '';
+        try { name = lm.add(8).readPointer().readCString() || ''; } catch (_) {}
+        if (/xiam|memfd:|frida/i.test(name)) {
+            const l_addr = lm.readPointer();
+            console.log(`!! [${idx}] lm=${lm} l_addr=${l_addr}  "${name}"`);
+            hits++;
         }
-        if (!strtab.isNull() && soname_off >= 0 && soname_off < strsz + 1024) {
-          // 有些库 strtab 是相对地址, 加上 l_addr 兜底
-          let s = '';
-          try { s = strtab.add(soname_off).readCString() || ''; } catch (e) {}
-          if (s === '' && !l_addr.isNull()) {
-            try { s = l_addr.add(strtab).add(soname_off).readCString() || ''; } catch (e) {}
-          }
-          soname = s;
-        }
-      }
-    } catch (e) {}
-
-    // 标可疑
-    let mark = '   ';
-    for (const k of HIT_LNAME)  if (l_name.indexOf(k)  !== -1) { mark = '!! '; break; }
-    if (mark === '   ') for (const k of HIT_SONAME) if (soname.indexOf(k) !== -1) { mark = '!! '; break; }
-    if (mark === '!! ') hits++;
-
-    const namePart = (l_name || '<null>').padEnd(46);
-    const soPart   = soname || '';
-    lines.push(`${mark}${String(idx).padStart(5)}  ${l_addr.toString().padEnd(18)}${namePart}  ${soPart}`);
-
-    cur = l_next;
-    idx++;
-  }
-
-  lines.push('');
-  lines.push(`---- 总条目: ${idx},  命中: ${hits} ----`);
-  lines.push(`---- 行首 [!!] = l_name 含 frida//memfd:/jvmti.so/jdwp.so, 或 SONAME 含 frida/-agent-raw.so ----`);
-  dump('link_map (l_name + DT_SONAME)', lines.join('\n'));
-  return hits;
+        lm = lm.add(24).readPointer();
+        idx++;
+    }
+    console.log(`---- 总 ${idx}, 命中 ${hits} ----`);
+    return hits;
 }
 
-// ---------------- bionic solist (Android 专用, 内部链表) ----------------
-// 走 linker64 的私有符号 __dl__ZL6solist (mangled, "solist")
-// 每个 soinfo 节点结构在不同 Android 版本不同, 这里只读 next + base + size_or_name
-// 用来对比看 dlopen 用 RTLD_NOLOAD 后, soinfo 是否还残留(常见反检测被链接器断链)
+// ── 4) unlinkProbe / unlinkDo ───────────────────────────────────────────────
+//   AOSP arm64 标准偏移: soinfo.next=0x28, soinfo.link_map_head=0xd0
+//   单向摘: prev_so.next = self.next  +  prev_so.l_next = next_so + 0xd0
+function _solistHead() {
+    const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+    const sym = linker.enumerateSymbols().find(s => s.name.indexOf('_ZL6solist') !== -1);
+    if (!sym) throw new Error('linker .symtab 没有 __dl__ZL6solist');
+    return sym.address.readPointer();
+}
+
+// 走 solist 单链表 (bionic 私有, dl_iterate_phdr 走的就是这条)
+//   每个 soinfo: l_name 在 +0xd0+8 (link_map_head.l_name)
+//   只打 xiam/memfd/frida 命中
 function soList() {
-  const linkers = ['linker64', 'linker'];
-  let listSym = null;
-  let linkerName = null;
-  for (const ln of linkers) {
-    try {
-      const m = Process.getModuleByName(ln);
-      // bionic 内部全局符号常见 mangled 名
-      const candidates = [
-        '__dl__ZL6solist',
-        '__dl_solist',
-        '__dl__ZL19__linker_dl_err_buf',  // 仅作存在性测试
-      ];
-      for (const c of candidates) {
-        const s = m.findExportByName(c);
-        if (s) {
-          // 我们只要 solist
-          if (c.indexOf('solist') !== -1) {
-            listSym = s;
-            linkerName = ln;
-            break;
-          }
+    let head;
+    try { head = _solistHead(); }
+    catch (e) { console.log('soList: ' + e.message); return 0; }
+    let cur = head;
+    let idx = 0, hits = 0;
+    while (!cur.isNull() && idx < 4096) {
+        let name = '';
+        try { name = cur.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+        if (/xiam|memfd:|frida/i.test(name)) {
+            console.log(`!! [${idx}] so=${cur} l_addr=${cur.add(0xd0).readPointer()}  "${name}"`);
+            hits++;
         }
-      }
-      if (listSym) break;
-    } catch (e) {}
-  }
-  if (listSym === null) {
-    dump('bionic solist',
-      '<__dl__ZL6solist 符号在该 linker 上未导出, ' +
-      '此 Android 版本需要通过解析 linker .symtab 或已知偏移寻址>');
-    return;
-  }
-  // *listSym 即第一个 soinfo*
-  let cur = listSym.readPointer();
-  const lines = [`solist head @ ${listSym} (in ${linkerName})`];
-  lines.push('[idx]  soinfo*           base              size       next              name');
-
-  // soinfo 字段顺序在 bionic Android 11+ 是:
-  //   char old_name[128];     // 0x000  (历史遗留)
-  //   const ElfW(Phdr)* phdr; // 0x080
-  //   size_t phnum;           // 0x088
-  //   ElfW(Addr) base;        // 0x098
-  //   size_t size;            // 0x0a0
-  //   uint32_t flags_;        ...
-  //   soinfo* next;           // 0x028 (历史) 或在底部
-  // 不同版本偏移变化大, 这里仅做最小尝试: 假设 next 在 0x28, base 在 0x90, size 在 0x98
-  // 不一定对所有 Android 版本都准, 不过链表能跑通就有价值
-  let idx = 0;
-  while (!cur.isNull() && idx < 512) {
-    let base, size, next, name;
-    try {
-      next = cur.add(0x28).readPointer();
-      base = cur.add(0x90).readPointer();
-      size = cur.add(0x98).readU64();
-      name = cur.readCString(128) || '';
-    } catch (e) {
-      lines.push(`${String(idx).padStart(5)}  ${cur}  <read error: ${e.message}>`);
-      break;
+        cur = cur.add(0x28).readPointer();
+        idx++;
     }
-    lines.push(
-      `${String(idx).padStart(5)}  ${cur.toString().padEnd(18)}` +
-      `${base.toString().padEnd(18)}${('0x' + size.toString(16)).padEnd(11)} ${next.toString().padEnd(18)}${name}`
-    );
-    cur = next;
-    idx++;
-  }
-  dump('bionic solist (linker 私有链表, soinfo 视角)',
-       lines.join('\n') + `\n---- ${idx} entries (字段偏移按 Android 11+ 估算, 名字若错请按版本核对偏移) ----`);
+    console.log(`---- 总 ${idx}, 命中 ${hits} ----`);
+    return hits;
 }
 
-// ---------------- 触发 frida agent 自摘链 ----------------
-// 调用 agent 内部导出的 xiam_unlink_self(), 把自己从 solist + r_debug.r_map
-// 双链表里摘掉. 调完再跑 linkMap() 应该看不到 xiam-64.so.
-function unlinkSelf() {
-  // 1) findGlobalExportByName 不一定枚举到 memfd-loaded agent, 试着先用
-  let sym = null;
-  try { sym = Module.findGlobalExportByName('xiam_unlink_self'); } catch (e) {}
-
-  // 2) 找不到就显式枚举所有模块 (含 memfd:xiam-64.so), 在含 'xiam' 的模块里 findExportByName
-  if (sym === null) {
-    const mods = Process.enumerateModules();
-    console.log(`[unlink] enumerated ${mods.length} modules, searching xiam-* ...`);
-    for (const m of mods) {
-      if (!/xiam/i.test(m.name) && !/xiam/i.test(m.path || '')) continue;
-      console.log(`[unlink] candidate: name=${m.name} path=${m.path} base=${m.base}`);
-      try {
-        const s = m.findExportByName('xiam_unlink_self');
-        if (s) { sym = s; break; }
-      } catch (e) {}
+function _walkSolist(filterRe) {
+    const head = _solistHead();
+    let prev = head, cur = head.add(0x28).readPointer(), idx = 1;
+    while (!cur.isNull() && idx < 4096) {
+        let name = '';
+        try { name = cur.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+        if (filterRe.test(name)) {
+            return { prev, self: cur, next: cur.add(0x28).readPointer(), name, idx };
+        }
+        prev = cur;
+        cur = cur.add(0x28).readPointer();
+        idx++;
     }
-  }
-
-  // 3) 最后兜底: 用 dlsym(RTLD_DEFAULT)
-  if (sym === null) {
-    try {
-      const dlsym = new NativeFunction(
-        libc.findExportByName('dlsym') || Module.getGlobalExportByName('dlsym'),
-        'pointer', ['pointer', 'pointer']);
-      const RTLD_DEFAULT = ptr('0');
-      const s = dlsym(RTLD_DEFAULT, Memory.allocUtf8String('xiam_unlink_self'));
-      if (!s.isNull()) sym = s;
-    } catch (e) {}
-  }
-
-  if (sym === null) {
-    console.log('[unlink] xiam_unlink_self 三种方式都找不到, 检查 agent 是否更新');
-    return -1;
-  }
-
-  console.log(`[unlink] resolved symbol @ ${sym}`);
-  const fn = new NativeFunction(sym, 'int', []);
-  const ret = fn();
-  console.log(`[unlink] xiam_unlink_self() = ${ret}  ${ret === 0 ? '(ok)' : '(failed, see logcat -s xiam-unlink)'}`);
-  return ret;
+    return null;
 }
 
-// ---------------- 经典 hook 隐藏方案验证 ----------------
-// 思路: hook 前记录 range, mprotect rwx, attach, flush, mprotect r-x.
-// 比对 hook 前/后的 /proc/self/maps, 看 libc 段是否撕成多片 / 是否出现 rwxp.
-//
-// 用法:
-//   testHookHide('open')                 // 默认 hook libc 的 open
-//   testHookHide('libc.so', 'fopen')     // 指定 module + symbol
-//   testHookHide('libc.so', null, 0x1000) // 直接 hook 偏移
-function testHookHide(arg1, arg2, arg3) {
-  let modName, symName, off;
-  if (typeof arg1 === 'string' && arg2 === undefined) {
-    modName = 'libc.so'; symName = arg1; off = null;
-  } else if (typeof arg2 === 'string') {
-    modName = arg1; symName = arg2; off = null;
-  } else {
-    modName = arg1; symName = null; off = arg3;
-  }
-
-  console.log(`\n========== testHookHide(${modName}, ${symName}, ${off}) ==========`);
-
-  let target;
-  let mod;
-  try { mod = Process.getModuleByName(modName); }
-  catch (e) { console.log(`[err] module ${modName} not found`); return; }
-
-  if (symName) {
-    target = mod.findExportByName(symName);
-    if (!target) {
-      console.log(`[err] symbol ${symName} not found in ${modName}`);
-      return;
-    }
-  } else if (off !== null && off !== undefined) {
-    target = mod.base.add(off);
-  } else {
-    console.log('[err] need symName or off');
-    return;
-  }
-  console.log(`[hook] target = ${target}  (${modName}!${symName || 'off=' + off})`);
-
-  // ---- 步骤 1: hook 前快照 ----
-  function snapshotMapsForModule(name) {
-    const txt = readAll('/proc/self/maps');
-    return txt.split('\n').filter(l => l.includes(name));
-  }
-  const before = snapshotMapsForModule(modName);
-  console.log('\n----- maps BEFORE hook -----');
-  before.forEach(l => console.log('  ' + l));
-  console.log(`  (total ${before.length} lines)`);
-
-  // 找目标 range. hook 目标必在 .text, range.protection 必为 r-x.
-  // 我们只对这个 r-xp 段做 mprotect rwx -> 写跳板 -> 还原 r-x;
-  // .rodata (r--p) / .data (rw-p) 不动. 这就是用户思路的实现.
-  let range = null;
-  try { range = Process.findRangeByAddress(target); } catch (e) {}
-  if (!range) {
-    console.log('[err] findRangeByAddress failed');
-    return;
-  }
-  console.log(`\n[hook] target range: base=${range.base} size=0x${range.size.toString(16)} prot=${range.protection}`);
-  if (range.protection !== 'r-x' && range.protection !== 'r-xp') {
-    console.log(`[warn] target range prot=${range.protection}, 不是 r-x 段, 不该 hook 这里`);
-    /* 仍然继续, 让用户看到结果 */
-  }
-
-  // ---- 步骤 2: 经典 5 步 ----
-  console.log('\n----- step: mprotect rwx -----');
-  try {
-    Memory.protect(range.base, range.size, 'rwx');
-    console.log('[ok] mprotect rwx');
-  } catch (e) {
-    console.log('[err] mprotect rwx: ' + e.message);
-    return;
-  }
-
-  console.log('----- step: Interceptor.attach -----');
-  let listener;
-  try {
-    listener = Interceptor.attach(target, {
-      onEnter(args) { /* nop, 只测试段变化 */ }
-    });
-    console.log('[ok] attached');
-  } catch (e) {
-    console.log('[err] attach: ' + e.message);
-  }
-
-  console.log('----- step: Interceptor.flush -----');
-  try { Interceptor.flush(); console.log('[ok] flushed'); }
-  catch (e) { console.log('[err] flush: ' + e.message); }
-
-  console.log('----- step: mprotect r-x -----');
-  try {
-    Memory.protect(range.base, range.size, 'r-x');
-    console.log('[ok] mprotect r-x');
-  } catch (e) {
-    console.log('[err] mprotect r-x: ' + e.message);
-  }
-
-  // ---- 步骤 3: hook 后快照 ----
-  const after = snapshotMapsForModule(modName);
-  console.log('\n----- maps AFTER hook -----');
-  after.forEach(l => console.log('  ' + l));
-  console.log(`  (total ${after.length} lines)`);
-
-  // ---- 步骤 4: 评估 ----
-  console.log('\n----- DIFF -----');
-  console.log(`  segments before: ${before.length}, after: ${after.length}`);
-
-  const beforeRwxp = before.filter(l => l.includes('rwxp')).length;
-  const afterRwxp  = after.filter(l => l.includes('rwxp')).length;
-  console.log(`  rwxp segments before: ${beforeRwxp}, after: ${afterRwxp}`);
-
-  if (after.length > before.length) {
-    console.log(`  [!!] 段被撕了 ${after.length - before.length} 块`);
-  } else if (after.length === before.length && afterRwxp === beforeRwxp) {
-    console.log('  [PASS] 段数量和 rwxp 数量都没变, 经典方案 ok');
-  } else if (afterRwxp > beforeRwxp) {
-    console.log('  [!!] 没撕段但出现了 rwxp');
-  } else {
-    console.log('  [?] 段数变化但情况复杂, 看上面 diff');
-  }
-
-  // ---- 步骤 5: 清理 (可选) ----
-  if (listener) {
-    try { listener.detach(); Interceptor.flush(); } catch (e) {}
-  }
-  console.log('========== end ==========\n');
+function unlinkProbe(soName) {
+    soName = soName || 'xiam';
+    const r = _walkSolist(new RegExp(soName, 'i'));
+    if (!r) { console.log(`"${soName}" 不在 solist 上`); return null; }
+    const a1 = r.prev.add(0x28);
+    const v1 = r.next;
+    const a2 = r.prev.add(0xe8);
+    const v2 = r.next.isNull() ? ptr(0) : r.next.add(0xd0);
+    console.log(`HIT idx=${r.idx} "${r.name}"`);
+    console.log(`  prev=${r.prev}  self=${r.self}  next=${r.next}`);
+    console.log(`  写[1] *(${a1}) = ${v1}    (solist: prev.next = self.next)`);
+    console.log(`  写[2] *(${a2}) = ${v2}    (r_map: prev.l_next = next_lm)`);
+    return { writes: [{a: a1, v: v1}, {a: a2, v: v2}] };
 }
 
-// ---------------- dlopen 拦截 ----------------
-function hookDlopen() {
-  const targets = ['android_dlopen_ext', 'dlopen'];
-  let hooked = 0;
-
-  targets.forEach(name => {
-    let addr = libc.findExportByName(name);
-    if (addr === null) {
-      const linkers = ['linker64', 'linker'];
-      for (const ln of linkers) {
+function unlinkDo(soName) {
+    const r = unlinkProbe(soName);
+    if (!r) return false;
+    for (const w of r.writes) {
+        const range = Process.findRangeByAddress(w.a);
+        const orig  = range ? range.protection : null;
+        const need  = orig && orig.indexOf('w') < 0;
         try {
-          const m = Process.getModuleByName(ln);
-          addr = m.findExportByName(name);
-          if (addr) break;
-        } catch (e) {}
-      }
-    }
-    if (addr === null) {
-      console.log(`[dlopen-hook] ${name} not found, skip`);
-      return;
-    }
-
-    Interceptor.attach(addr, {
-      onEnter(args) {
-        this.fname = args[0].isNull() ? '<null>' : args[0].readCString();
-        this.flags = args[1].toInt32();
-        if (name === 'android_dlopen_ext') {
-          this.extinfo = args[2];
+            if (need) Memory.protect(range.base, range.size, 'rw-');
+            w.a.writePointer(w.v);
+            if (need) Memory.protect(range.base, range.size, orig);
+            console.log(`  ✓ *(${w.a}) = ${w.v}`);
+        } catch (e) {
+            console.log(`  ✗ *(${w.a}) write fail: ${e.message}`);
+            return false;
         }
-      },
-      onLeave(retval) {
-        const flagsHex = '0x' + (this.flags >>> 0).toString(16);
-        const ret = retval.toString();
-        let extra = '';
-        if (name === 'android_dlopen_ext' && this.extinfo && !this.extinfo.isNull()) {
-          try {
-            const eflags = this.extinfo.readU64();
-            extra = `  ext.flags=0x${eflags.toString(16)}`;
-          } catch (e) {}
-        }
-        console.log(`[dlopen] ${name}("${this.fname}", ${flagsHex}) = ${ret}${extra}`);
-      },
-    });
-    hooked++;
-  });
-
-  console.log(`[dlopen-hook] installed on ${hooked} target(s).`);
+    }
+    console.log(`done. 跑 linkMap() 验证`);
+    return true;
 }
 
-// ---------------- 暴露 ----------------
-rpc.exports = {
-  all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
-  threads, fds, unix, tmp, hookDlopen,
-  dlIter, rDebug, soList, linkMap,
-  unlinkSelf,
-  testHookHide,
-  detect,
-};
+// ── 5) threads: 列所有线程, 高亮 frida/gum 风控关键字 ──────────────────────
+function threads() {
+    // /proc/self/task 下每个目录就是一个 tid
+    const taskDir = PROC_SELF + '/task';
+    const opendir = new NativeFunction(Module.getGlobalExportByName('opendir'), 'pointer', ['pointer']);
+    const readdir = new NativeFunction(Module.getGlobalExportByName('readdir'), 'pointer', ['pointer']);
+    const closedir = new NativeFunction(Module.getGlobalExportByName('closedir'), 'int', ['pointer']);
+    const dir = opendir(Memory.allocUtf8String(taskDir));
+    if (dir.isNull()) { console.log('opendir failed'); return; }
+    const tids = [];
+    let ent;
+    while (!(ent = readdir(dir)).isNull()) {
+        const name = ent.add(19).readCString();   // dirent.d_name @ +19 on bionic arm64
+        if (/^\d+$/.test(name)) tids.push(name);
+    }
+    closedir(dir);
 
-// 同名挂到全局, REPL 里直接 maps() 调
-Object.assign(globalThis, {
-  all, status, cmdline, maps, mapsRaw, smaps, smapsFilt,
-  threads, fds, unix, tmp, hookDlopen,
-  dlIter, rDebug, soList, linkMap,
-  unlinkSelf,
-  testHookHide,
-  detect,
-});
+    console.log(`=== /proc/self/task  ${tids.length} threads ===`);
+    let hits = 0;
+    for (const tid of tids) {
+        let comm = '';
+        try { comm = _slurp(`${taskDir}/${tid}/comm`).trim(); } catch (_) {}
+        const susp = /frida|gum|gmain|gdbus|pool-spawner|gjs-loop/i.test(comm);
+        if (susp) { console.log(`!! ${tid.padEnd(7)} ${comm}`); hits++; }
+    }
+    console.log(`---- 命中 ${hits}/${tids.length} ----`);
+}
 
-hookDlopen();
+// ── 6) status: /proc/self/status 摘要 (TracerPid / Name / Uid) ─────────────
+function status() {
+    const txt = _slurp(PROC_SELF + '/status');
+    const want = /^(Name|Tgid|Pid|PPid|TracerPid|Uid|Gid|Threads):/;
+    const lines = txt.split('\n').filter(l => want.test(l));
+    console.log('=== /proc/self/status (摘要) ===');
+    console.log(lines.join('\n'));
+}
 
-console.log('[feature-scan] loaded.');
-console.log('  maps()      只看 libc/libart/libandroid_runtime/xiam');
-console.log('  mapsRaw()   全量 /proc/self/maps');
-console.log('  smaps() / smapsFilt()');
-console.log('  threads() fds() unix() status() cmdline() tmp([name])');
-console.log('  dlIter()    dl_iterate_phdr 公开 API 枚举 so');
-console.log('  rDebug()    遍历 _r_debug.r_map (link_map 链表)');
-console.log('  linkMap()   link_map 链表 + DT_SONAME (常见风控视角)');
-console.log('  soList()    遍历 bionic linker 私有 solist (Android)');
-console.log('  all()       一把全跑 (打印各 /proc 接口原始内容)');
-console.log('  detect()    模拟反 frida 检测器, 给出强/弱特征汇总报告');
-console.log('              detect.maps()/threads()/so()/fds()/ports() 单跑');
-console.log('  hookDlopen() 已自动挂上');
+// ── 7) fds: 列 /proc/self/fd, 高亮可疑 ─────────────────────────────────────
+function fds() {
+    const opendir = new NativeFunction(Module.getGlobalExportByName('opendir'), 'pointer', ['pointer']);
+    const readdir = new NativeFunction(Module.getGlobalExportByName('readdir'), 'pointer', ['pointer']);
+    const closedir = new NativeFunction(Module.getGlobalExportByName('closedir'), 'int', ['pointer']);
+    const readlink = new NativeFunction(Module.getGlobalExportByName('readlink'), 'long',
+        ['pointer', 'pointer', 'ulong']);
+
+    const dir = opendir(Memory.allocUtf8String(PROC_SELF + '/fd'));
+    if (dir.isNull()) { console.log('opendir failed'); return; }
+    const buf = Memory.alloc(512);
+    const entries = [];
+    let ent;
+    while (!(ent = readdir(dir)).isNull()) {
+        const name = ent.add(19).readCString();
+        if (!/^\d+$/.test(name)) continue;
+        const path = PROC_SELF + '/fd/' + name;
+        const n = readlink(Memory.allocUtf8String(path), buf, 511);
+        let target = '';
+        if (n > 0) target = buf.readUtf8String(n.toNumber());
+        entries.push({fd: name, target});
+    }
+    closedir(dir);
+
+    console.log(`=== /proc/self/fd  ${entries.length} fds ===`);
+    let hits = 0;
+    const re = /memfd:|frida|xiam|re\.frida|linjector|gadget|socket:/i;
+    for (const e of entries) {
+        if (re.test(e.target)) { console.log(`!! ${e.fd.padEnd(4)} -> ${e.target}`); hits++; }
+    }
+    console.log(`---- 可疑 ${hits}/${entries.length} ----`);
+}
+
+// ── 8) ports: /proc/net/tcp 看本地监听端口 (找 27042 / 14725 等 frida 默认) ─
+function ports() {
+    const txt = _slurp('/proc/net/tcp');
+    const lines = txt.split('\n');
+    console.log('=== /proc/net/tcp  本地监听 (state=0A) ===');
+    let n = 0;
+    for (const line of lines) {
+        const m = line.match(/^\s*\d+:\s+([0-9A-F]{8}):([0-9A-F]{4})\s+([0-9A-F]{8}):([0-9A-F]{4})\s+(\w\w)/);
+        if (!m) continue;
+        if (m[5] !== '0A') continue;   // 0A = LISTEN
+        const port = parseInt(m[2], 16);
+        const susp = (port === 27042 || port === 27043 || port === 14725 || port === 14735);
+        const flag = susp ? '!!' : '  ';
+        console.log(`${flag} 0.0.0.0:${port}`);
+        if (susp) n++;
+    }
+    console.log(`---- 命中 frida 默认端口: ${n} ----`);
+}
+
+// ── 9) rtldHook: 对比 rtld_db_dlactivity 内存字节 vs linker64 文件字节 ──
+//
+//   frida-gum 内部装在 linker 的 r_brk (= rtld_db_dlactivity) 上, 监听
+//   dlopen/dlclose. 风控扫这条:
+//     mem  = readMem(rtld_db_dlactivity, N)
+//     file = readFile('/apex/.../linker64', file_offset, N)
+//     if mem != file: 被 hook
+//
+//   frida17_shadow PTE 切 alt 让 mem read 看到干净字节, 这里能验证.
+const _lseek = new NativeFunction(Module.getGlobalExportByName('lseek'), 'long', ['int', 'long', 'int']);
+
+function rtldHook() {
+    const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+    if (!linker) { console.log('linker module not found'); return null; }
+
+    // 1) 找 rtld_db_dlactivity 内存地址 (优先 .symtab, 兜底 _r_debug.r_brk)
+    let addr = null;
+    for (const s of linker.enumerateSymbols()) {
+        if (/rtld_db_dlactivity/.test(s.name)) { addr = s.address; break; }
+    }
+    if (!addr) {
+        const rd = _findRDebugViaDtDebug();
+        if (rd && !rd.isNull()) addr = rd.add(16).readPointer();   // r_brk @ +0x10
+    }
+    if (!addr || addr.isNull()) { console.log('rtld_db_dlactivity not resolved'); return null; }
+
+    // 2) vaddr → file offset (走 ELF phdr)
+    const vaddr   = parseInt(addr.sub(linker.base).toString());
+    const phoff   = parseInt(linker.base.add(0x20).readU64().toString());
+    const phentsz = linker.base.add(0x36).readU16();
+    const phnum   = linker.base.add(0x38).readU16();
+    let fileOff = -1;
+    for (let i = 0; i < phnum; i++) {
+        const ph = linker.base.add(phoff + i * phentsz);
+        if (ph.readU32() !== 1) continue;   // PT_LOAD
+        const pOff   = parseInt(ph.add(0x08).readU64().toString());
+        const pVaddr = parseInt(ph.add(0x10).readU64().toString());
+        const pFsz   = parseInt(ph.add(0x20).readU64().toString());
+        if (vaddr >= pVaddr && vaddr < pVaddr + pFsz) {
+            fileOff = (vaddr - pVaddr) + pOff;
+            break;
+        }
+    }
+    if (fileOff < 0) { console.log('vaddr → file offset 翻译失败'); return null; }
+
+    // 3) 读内存
+    const N = 32;
+    const memBytes = new Uint8Array(addr.readByteArray(N));
+
+    // 4) 读文件
+    const fd = _open(Memory.allocUtf8String(linker.path), 0);
+    if (fd < 0) { console.log('open ' + linker.path + ' 失败'); return null; }
+    _lseek(fd, fileOff, 0);
+    const fbuf = Memory.alloc(N);
+    const n = _read(fd, fbuf, N).valueOf();
+    _close(fd);
+    if (n < N) { console.log(`只读到 ${n} 字节`); return null; }
+    const fileBytes = new Uint8Array(fbuf.readByteArray(N));
+
+    // 5) 对比
+    const diff = [];
+    for (let i = 0; i < N; i++) if (memBytes[i] !== fileBytes[i]) diff.push(i);
+    const hex = a => Array.from(a).map(b => b.toString(16).padStart(2,'0')).join(' ');
+
+    console.log(`rtld_db_dlactivity:`);
+    console.log(`  ${linker.name} base=${linker.base} path=${linker.path}`);
+    console.log(`  func @ ${addr}  (linker+0x${vaddr.toString(16)}, file off=0x${fileOff.toString(16)})`);
+    console.log(`  file: ${hex(fileBytes)}`);
+    console.log(`  mem : ${hex(memBytes)}`);
+    if (diff.length === 0) {
+        console.log(`  ✓ identical — 没有 hook (或 PTE shadow 让读拿到干净字节)`);
+    } else {
+        console.log(`  ★ ${diff.length} bytes differ at +[${diff.join(',')}]`);
+        console.log(`  ★ rtld_db_dlactivity 被改写 (frida 蹦床或别的 inline hook)`);
+    }
+    return { addr, fileOff, mem: memBytes, file: fileBytes, diff: diff.length };
+}
+
+// ── 10) detect: 综合 frida 反检测全套, 打印每个命中的具体内容 ───────────────
+function detect() {
+    const SUSP = /xiam|memfd:|frida|gadget|linjector/i;
+    const TPATT = /frida|gum|gmain|gdbus|pool-spawner|gjs-loop/i;
+    const FDPATT = /memfd:|frida|xiam|re\.frida|linjector|gadget/i;
+    const FRIDA_PORTS = [27042, 27043, 14725, 14735];
+
+    const hits = { maps: [], threads: [], fds: [], linkMap: [], soList: [], ports: [], rtld: [] };
+    let mapsTotal = 0, threadsTotal = 0, fdsTotal = 0, lmTotal = 0, soTotal = 0;
+
+    // ── 1) maps ──
+    try {
+        const t = _slurp(PROC_SELF + '/maps');
+        const lines = t.split('\n');
+        mapsTotal = lines.length;
+        for (const l of lines) if (SUSP.test(l)) hits.maps.push(l);
+    } catch (_) {}
+
+    // ── 2) threads ──
+    try {
+        const opendir = new NativeFunction(Module.getGlobalExportByName('opendir'), 'pointer', ['pointer']);
+        const readdir = new NativeFunction(Module.getGlobalExportByName('readdir'), 'pointer', ['pointer']);
+        const closedir = new NativeFunction(Module.getGlobalExportByName('closedir'), 'int', ['pointer']);
+        const dir = opendir(Memory.allocUtf8String(PROC_SELF + '/task'));
+        let ent;
+        while (!(ent = readdir(dir)).isNull()) {
+            const tid = ent.add(19).readCString();
+            if (!/^\d+$/.test(tid)) continue;
+            threadsTotal++;
+            let c = '';
+            try { c = _slurp(`${PROC_SELF}/task/${tid}/comm`).trim(); } catch (_) {}
+            if (TPATT.test(c)) hits.threads.push(`${tid.padEnd(7)} ${c}`);
+        }
+        closedir(dir);
+    } catch (_) {}
+
+    // ── 3) fds ──
+    try {
+        const opendir = new NativeFunction(Module.getGlobalExportByName('opendir'), 'pointer', ['pointer']);
+        const readdir = new NativeFunction(Module.getGlobalExportByName('readdir'), 'pointer', ['pointer']);
+        const closedir = new NativeFunction(Module.getGlobalExportByName('closedir'), 'int', ['pointer']);
+        const readlink = new NativeFunction(Module.getGlobalExportByName('readlink'), 'long', ['pointer', 'pointer', 'ulong']);
+        const dir = opendir(Memory.allocUtf8String(PROC_SELF + '/fd'));
+        const buf = Memory.alloc(512);
+        let ent;
+        while (!(ent = readdir(dir)).isNull()) {
+            const fd = ent.add(19).readCString();
+            if (!/^\d+$/.test(fd)) continue;
+            fdsTotal++;
+            const n = readlink(Memory.allocUtf8String(PROC_SELF + '/fd/' + fd), buf, 511);
+            if (n > 0) {
+                const target = buf.readUtf8String(n.toNumber());
+                if (FDPATT.test(target)) hits.fds.push(`${fd.padEnd(4)} -> ${target}`);
+            }
+        }
+        closedir(dir);
+    } catch (_) {}
+
+    // ── 4) link_map ──
+    try {
+        const rd = _findRDebugViaDtDebug();
+        if (rd && !rd.isNull()) {
+            let lm = rd.add(8).readPointer();
+            let i = 0;
+            while (!lm.isNull() && i < 1024) {
+                lmTotal++;
+                let n = '';
+                try { n = lm.add(8).readPointer().readCString() || ''; } catch (_) {}
+                if (/xiam|memfd:|frida/i.test(n)) hits.linkMap.push(`[${i}] ${lm}  "${n}"`);
+                lm = lm.add(24).readPointer();
+                i++;
+            }
+        }
+    } catch (_) {}
+
+    // ── 5) solist ──
+    try {
+        let cur = _solistHead();
+        let i = 0;
+        while (!cur.isNull() && i < 4096) {
+            soTotal++;
+            let n = '';
+            try { n = cur.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+            if (/xiam|memfd:|frida/i.test(n)) hits.soList.push(`[${i}] ${cur}  "${n}"`);
+            cur = cur.add(0x28).readPointer();
+            i++;
+        }
+    } catch (_) {}
+
+    // ── rtld_db_dlactivity 字节对比 ──
+    try {
+        const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+        if (linker) {
+            let addr = null;
+            for (const s of linker.enumerateSymbols())
+                if (/rtld_db_dlactivity/.test(s.name)) { addr = s.address; break; }
+            if (!addr) {
+                const rd = _findRDebugViaDtDebug();
+                if (rd && !rd.isNull()) addr = rd.add(16).readPointer();
+            }
+            if (addr && !addr.isNull()) {
+                const vaddr   = parseInt(addr.sub(linker.base).toString());
+                const phoff   = parseInt(linker.base.add(0x20).readU64().toString());
+                const phentsz = linker.base.add(0x36).readU16();
+                const phnum   = linker.base.add(0x38).readU16();
+                let fileOff = -1;
+                for (let i = 0; i < phnum; i++) {
+                    const ph = linker.base.add(phoff + i * phentsz);
+                    if (ph.readU32() !== 1) continue;
+                    const pOff   = parseInt(ph.add(0x08).readU64().toString());
+                    const pVaddr = parseInt(ph.add(0x10).readU64().toString());
+                    const pFsz   = parseInt(ph.add(0x20).readU64().toString());
+                    if (vaddr >= pVaddr && vaddr < pVaddr + pFsz) {
+                        fileOff = (vaddr - pVaddr) + pOff; break;
+                    }
+                }
+                if (fileOff >= 0) {
+                    const N = 32;
+                    const mem = new Uint8Array(addr.readByteArray(N));
+                    const fd = _open(Memory.allocUtf8String(linker.path), 0);
+                    if (fd >= 0) {
+                        _lseek(fd, fileOff, 0);
+                        const fbuf = Memory.alloc(N);
+                        const n = _read(fd, fbuf, N).valueOf();
+                        _close(fd);
+                        if (n === N) {
+                            const file = new Uint8Array(fbuf.readByteArray(N));
+                            let diff = 0;
+                            for (let i = 0; i < N; i++) if (mem[i] !== file[i]) diff++;
+                            if (diff > 0) hits.rtld.push(`${addr} differs at ${diff}/${N} bytes`);
+                        }
+                    }
+                }
+            }
+        }
+    } catch (_) {}
+
+    // ── 6) ports ──
+    try {
+        const t = _slurp('/proc/net/tcp');
+        for (const line of t.split('\n')) {
+            const m = line.match(/^\s*\d+:\s+[0-9A-F]+:([0-9A-F]{4})\s+\S+\s+(\w\w)/);
+            if (m && m[2] === '0A') {
+                const p = parseInt(m[1], 16);
+                if (FRIDA_PORTS.indexOf(p) >= 0) hits.ports.push(`0.0.0.0:${p}`);
+            }
+        }
+    } catch (_) {}
+
+    // ── 打印 ──
+    const total = hits.maps.length + hits.threads.length + hits.fds.length
+                + hits.linkMap.length + hits.soList.length + hits.ports.length
+                + hits.rtld.length;
+
+    function section(label, list, totalCount, viewHint) {
+        const n = list.length;
+        const tag = n ? '★' : '✓';
+        const head = `[${label.padEnd(8)}]  ${tag} ${String(n).padStart(3)} hit / ${String(totalCount).padStart(4)} total` +
+                     (viewHint ? `   (${viewHint})` : '');
+        console.log(head);
+        for (const item of list) console.log('             ' + item);
+    }
+
+    console.log('');
+    console.log('════════════════════════════════════════════════════════════════════');
+    console.log('  detect — frida 痕迹扫描');
+    console.log('════════════════════════════════════════════════════════════════════');
+    section('maps',     hits.maps,    mapsTotal,    '/proc/self/maps');
+    section('threads',  hits.threads, threadsTotal, '/proc/self/task/*/comm');
+    section('fds',      hits.fds,     fdsTotal,     '/proc/self/fd/*');
+    section('link_map', hits.linkMap, lmTotal,      'r_debug.r_map');
+    section('solist',   hits.soList,  soTotal,      'dl_iterate_phdr');
+    section('rtld',     hits.rtld,    1,            'rtld_db_dlactivity 内存 vs 文件');
+    section('ports',    hits.ports,   FRIDA_PORTS.length, '/proc/net/tcp LISTEN');
+    console.log('────────────────────────────────────────────────────────────────────');
+    console.log(`  TOTAL: ${total} hits  ${total ? '★ DETECTED' : '✓ CLEAN'}`);
+    console.log('════════════════════════════════════════════════════════════════════');
+    console.log('');
+
+    return {
+        maps: hits.maps.length, threads: hits.threads.length, fds: hits.fds.length,
+        linkMap: hits.linkMap.length, soList: hits.soList.length, rtld: hits.rtld.length,
+        ports: hits.ports.length, total,
+    };
+}
+
+// ── 暴露到 REPL ────────────────────────────────────────────────────────────
+rpc.exports = { maps, mapsRaw, cmdline, linkMap, soList, unlinkProbe, unlinkDo,
+                threads, status, fds, ports, rtldHook, detect };
+Object.assign(globalThis, { maps, mapsRaw, cmdline, linkMap, soList, unlinkProbe, unlinkDo,
+                            threads, status, fds, ports, rtldHook, detect });
+
+console.log('[scan] loaded (no hooks installed).');
+console.log('  maps()         过滤 frida/xiam 痕迹');
+console.log('  mapsRaw()      全量 maps');
+console.log('  cmdline()      /proc/self/cmdline');
+console.log('  status()       /proc/self/status 摘要');
+console.log('  threads()      线程名扫描 (frida/gum/gmain 命中)');
+console.log('  fds()          /proc/self/fd 扫描 (memfd/socket/frida 命中)');
+console.log('  ports()        本地监听端口扫描 (frida 默认端口)');
+console.log('  linkMap()      r_debug.r_map 上 xiam/memfd/frida 命中 (双链表)');
+console.log('  soList()       solist (bionic 私有, dl_iterate_phdr 视角) 命中');
+console.log('  rtldHook()     ★ 对比 rtld_db_dlactivity 内存字节 vs linker 文件字节');
+console.log('  detect()       一把跑完 (maps + threads + linkMap + solist + rtld + ports)');
+console.log('  unlinkProbe()  dry-run 断链计划');
+console.log('  unlinkDo()     真断链 (单向 forward, 2 个写)');

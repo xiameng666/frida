@@ -79,25 +79,58 @@ function _findRDebugViaDtDebug() {
     return null;
 }
 
+// 双向遍历 r_debug.r_map:
+//   forward 走 l_next (+0x18), reverse 走 l_prev (+0x20).
+//   forward / reverse 差集 = "半摘节点" (单向 forward unlink 漏洞).
 function linkMap() {
     const rd = _findRDebugViaDtDebug();
-    if (!rd || rd.isNull()) { console.log('r_debug not found'); return; }
+    if (!rd || rd.isNull()) { console.log('r_debug not found'); return null; }
     console.log('r_debug @', rd);
-    let lm = rd.add(8).readPointer();   // r_debug.r_map
-    let idx = 0, hits = 0;
-    while (!lm.isNull() && idx < 1024) {
-        let name = '';
-        try { name = lm.add(8).readPointer().readCString() || ''; } catch (_) {}
-        if (/xiam|memfd:|frida/i.test(name)) {
-            const l_addr = lm.readPointer();
-            console.log(`!! [${idx}] lm=${lm} l_addr=${l_addr}  "${name}"`);
-            hits++;
-        }
-        lm = lm.add(24).readPointer();
-        idx++;
+
+    const fwd = new Set();
+    const fwdHits = [];
+    let lm = rd.add(8).readPointer();
+    let tail = lm;
+    let i = 0;
+    while (!lm.isNull() && i < 4096) {
+        fwd.add(lm.toString());
+        let n = '';
+        try { n = lm.add(8).readPointer().readCString() || ''; } catch (_) {}
+        if (/xiam|memfd:|frida/i.test(n)) fwdHits.push(`fwd[${i}] ${lm} "${n}"`);
+        tail = lm;
+        lm = lm.add(0x18).readPointer();
+        i++;
     }
-    console.log(`---- 总 ${idx}, 命中 ${hits} ----`);
-    return hits;
+
+    const revHits = [];
+    const hidden = [];
+    let cur = tail;
+    let j = 0;
+    while (!cur.isNull() && j < 4096) {
+        let n = '';
+        try { n = cur.add(8).readPointer().readCString() || ''; } catch (_) {}
+        if (!fwd.has(cur.toString())) {
+            const t = /xiam|memfd:|frida/i.test(n) ? '!! ' : '   ';
+            hidden.push(`${t}rev[${j}] ${cur} "${n}"`);
+        }
+        if (/xiam|memfd:|frida/i.test(n)) revHits.push(`rev[${j}] ${cur} "${n}"`);
+        cur = cur.add(0x20).readPointer();
+        j++;
+    }
+
+    console.log(`forward: ${i} 节点, xiam/frida 命中 ${fwdHits.length}`);
+    fwdHits.forEach(s => console.log('  ' + s));
+    console.log(`reverse: ${j} 节点, xiam/frida 命中 ${revHits.length}`);
+    revHits.forEach(s => console.log('  ' + s));
+    if (hidden.length) {
+        console.log(`!! 半摘 ${hidden.length} 个 (forward 看不到 / reverse 还在) — 单向 unlink 漏洞:`);
+        hidden.forEach(s => console.log('   ' + s));
+    } else if (fwdHits.length === 0 && revHits.length === 0) {
+        console.log(`✓ forward / reverse 都无 xiam/frida — r_map 视角干净`);
+    } else {
+        console.log(`  forward / reverse 集合一致 (无半摘), 但仍命中 xiam — 未 removeSoList`);
+    }
+    return { fwd: i, rev: j, hidden: hidden.length, hits: fwdHits.length };
 }
 
 // ── 4) unlinkProbe / unlinkDo ───────────────────────────────────────────────
@@ -149,25 +182,52 @@ function _walkSolist(filterRe) {
     return null;
 }
 
-function unlinkProbe(soName) {
+// removeSoList: 把 soName 匹配的 soinfo 从所有 SO 索引摘掉:
+//   W1: solist:    prev.next   = self.next
+//   W2: r_map fwd: prev.l_next = next_lm       (link_map.l_next)
+//   W3: r_map rev: next.l_prev = prev_lm       (link_map.l_prev, self 是 tail 时跳过)
+//   W4: ns:        prev_entry.next = next_entry  /  或 head_ = next_entry (self 是 head 时)
+//   W5: ns:        tail_ = prev_entry            (self 是 tail 时)
+function removeSoList(soName) {
     soName = soName || 'xiam';
     const r = _walkSolist(new RegExp(soName, 'i'));
-    if (!r) { console.log(`"${soName}" 不在 solist 上`); return null; }
-    const a1 = r.prev.add(0x28);
-    const v1 = r.next;
-    const a2 = r.prev.add(0xe8);
-    const v2 = r.next.isNull() ? ptr(0) : r.next.add(0xd0);
+    if (!r) { console.log(`"${soName}" 不在 solist 上`); return false; }
+
+    const writes = [
+        { a: r.prev.add(0x28), v: r.next,                                            desc: 'solist:    prev.next   = self.next' },
+        { a: r.prev.add(0xe8), v: r.next.isNull() ? ptr(0) : r.next.add(0xd0),       desc: 'r_map fwd: prev.l_next = next_lm' },
+    ];
+    if (!r.next.isNull()) {
+        writes.push({ a: r.next.add(0xf0), v: r.prev.add(0xd0), desc: 'r_map rev: next.l_prev = prev_lm' });
+    }
+
+    const nsR = _walkNsListForName(soName);
+    if (nsR) {
+        // W4: head_ 或 prev_entry.next
+        if (nsR.isHead) {
+            writes.push({ a: nsR.headAddr, v: nsR.next_entry,
+                          desc: 'ns:        head_       = entry.next' });
+        } else {
+            writes.push({ a: nsR.prev_entry, v: nsR.next_entry,
+                          desc: 'ns:        prev.next   = entry.next' });
+        }
+        // W5: tail_ 修正 (self 是 tail; isHead+isTail = 单节点, prev_entry = 0)
+        if (nsR.isTail) {
+            writes.push({ a: nsR.tailAddr, v: nsR.prev_entry,
+                          desc: 'ns:        tail_       = prev_entry' });
+        }
+    } else {
+        console.log(`(ns: "${soName}" 不在 g_default_namespace.soinfo_list_, 跳过 W4/W5)`);
+    }
+
     console.log(`HIT idx=${r.idx} "${r.name}"`);
     console.log(`  prev=${r.prev}  self=${r.self}  next=${r.next}`);
-    console.log(`  写[1] *(${a1}) = ${v1}    (solist: prev.next = self.next)`);
-    console.log(`  写[2] *(${a2}) = ${v2}    (r_map: prev.l_next = next_lm)`);
-    return { writes: [{a: a1, v: v1}, {a: a2, v: v2}] };
-}
+    if (nsR) {
+        console.log(`  ns: nsIdx=${nsR.idx} prev_entry=${nsR.prev_entry} self_entry=${nsR.self_entry} next_entry=${nsR.next_entry}  (isHead=${nsR.isHead} isTail=${nsR.isTail})`);
+    }
 
-function unlinkDo(soName) {
-    const r = unlinkProbe(soName);
-    if (!r) return false;
-    for (const w of r.writes) {
+    for (let i = 0; i < writes.length; i++) {
+        const w = writes[i];
         const range = Process.findRangeByAddress(w.a);
         const orig  = range ? range.protection : null;
         const need  = orig && orig.indexOf('w') < 0;
@@ -175,13 +235,13 @@ function unlinkDo(soName) {
             if (need) Memory.protect(range.base, range.size, 'rw-');
             w.a.writePointer(w.v);
             if (need) Memory.protect(range.base, range.size, orig);
-            console.log(`  ✓ *(${w.a}) = ${w.v}`);
+            console.log(`  ✓ 写[${i+1}] *(${w.a}) = ${w.v}    (${w.desc})`);
         } catch (e) {
-            console.log(`  ✗ *(${w.a}) write fail: ${e.message}`);
+            console.log(`  ✗ 写[${i+1}] *(${w.a}) fail: ${e.message}`);
             return false;
         }
     }
-    console.log(`done. 跑 linkMap() 验证`);
+    console.log(`done. 跑 linkMap() / defaultNamespace() / detect() 验证`);
     return true;
 }
 
@@ -352,15 +412,298 @@ function rtldHook() {
     return { addr, fileOff, mem: memBytes, file: fileBytes, diff: diff.length };
 }
 
-// ── 10) detect: 综合 frida 反检测全套, 打印每个命中的具体内容 ───────────────
+// ── 10) ldPreloads: 列 __dl__ZL13g_ld_preloads (LD_PRELOAD 注入清单) ─────────
+//
+//   bionic 私有: static soinfo_list_t g_ld_preloads;
+//     soinfo_list_t = LinkedList<soinfo>: { head_ @+0, tail_ @+8 }
+//     每个节点 LinkedListEntry: { next @+0, element @+8 (soinfo*) }
+//
+//   含义: 进程启动期 linker 从 env LD_PRELOAD 解析出来的 SO 列表.
+//   - 正常 app 通常为空.
+//   - frida-server 通过 ptrace + 远端 dlopen 装 agent, 不走 LD_PRELOAD → 这里看不见.
+//   - frida-gadget 用 LD_PRELOAD 注入时 → 这里直接暴露.
+//   风控检测点: 列表非空 + 含非系统 SO 名 ≈ 强信号.
+function ldPreloads() {
+    const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+    if (!linker) { console.log('linker module not found'); return null; }
+    const sym = linker.enumerateSymbols().find(s => s.name.indexOf('_ZL13g_ld_preloads') !== -1);
+    if (!sym) { console.log('linker .symtab 没有 __dl__ZL13g_ld_preloads'); return null; }
+
+    const addr = sym.address;
+    const head = addr.readPointer();          // head_ @ +0
+    const tail = addr.add(8).readPointer();   // tail_ @ +8
+
+    console.log(`=== g_ld_preloads @ ${addr}  head=${head}  tail=${tail} ===`);
+
+    if (head.isNull()) {
+        console.log('---- 空 (LD_PRELOAD 没注入任何 SO) ----');
+        return 0;
+    }
+
+    let cur = head;
+    let idx = 0, hits = 0;
+    while (!cur.isNull() && idx < 256) {
+        const next = cur.readPointer();           // LinkedListEntry.next     @ +0
+        const so   = cur.add(8).readPointer();    // LinkedListEntry.element  @ +8 (soinfo*)
+        let name = '<null>';
+        if (!so.isNull()) {
+            try { name = so.add(0xd0 + 8).readPointer().readCString() || '<empty>'; } catch (_) {}
+        }
+        const susp = /xiam|memfd:|frida|gadget/i.test(name);
+        const tag  = susp ? '!!' : '  ';
+        if (susp) hits++;
+        console.log(`${tag} [${idx}] entry=${cur} so=${so}  "${name}"`);
+        cur = next;
+        idx++;
+    }
+    console.log(`---- 总 ${idx}, 命中 ${hits} ----`);
+    return idx;
+}
+
+// ── 11) dlopenNoLoad: 验证 namespace.soinfo_list_ 没被摘 ──────────────────────
+//
+//   bionic dlopen(path, RTLD_NOLOAD): 只查当前 namespace 的 soinfo_list_,
+//     - 已加载 → 返回非空 handle (不实际 load)
+//     - 未加载 → 返回 NULL
+//
+//   即使 global solist + r_map 全摘, namespace 没摘 → 这里仍能查到.
+//   不传 soPath 则从 maps 里自动找含 xiam/frida 的 .so 路径.
+function dlopenNoLoad(soPath) {
+    if (!soPath) {
+        const txt = _slurp(PROC_SELF + '/maps');
+        const m = txt.match(/\s(\/\S*xiam\S*\.so)\b/i) || txt.match(/\s(\/\S*frida\S*\.so)\b/i);
+        if (!m) { console.log('maps 里未自动定位 xiam/frida agent SO, 显式传 soPath'); return null; }
+        soPath = m[1];
+        console.log(`(自动选 path: ${soPath})`);
+    }
+
+    const _dlopen  = new NativeFunction(Module.getGlobalExportByName('dlopen'),  'pointer', ['pointer', 'int']);
+    const _dlerror = new NativeFunction(Module.getGlobalExportByName('dlerror'), 'pointer', []);
+
+    _dlerror();
+    const RTLD_NOLOAD = 4;
+    const h = _dlopen(Memory.allocUtf8String(soPath), RTLD_NOLOAD);
+
+    if (!h.isNull()) {
+        console.log(`!! dlopen("${soPath}", RTLD_NOLOAD) = ${h}`);
+        console.log(`   ★ namespace 仍能查到 → 摘链没碰 namespace.soinfo_list_`);
+    } else {
+        const ep = _dlerror();
+        const err = ep.isNull() ? '<no error>' : ep.readCString();
+        console.log(`✓ dlopen NULL  (err: ${err})  当前 namespace 看不到`);
+    }
+    return h;
+}
+
+// ── 13) dlIterPhdr: 公开 API 视角 (风控最爱直接用这条 enumerate) ─────────────
+//
+//   dl_iterate_phdr 是 linker 暴露的公开枚举 API. bionic 内部走 global solist,
+//   等价于 soList() 但走公开 API.
+//   作用: 验证 "私有 solist 摘了 → 公开 API 是否同步看不到".
+//   若两者结果不一致, 说明 linker 内还有别的 SO 索引漏掉了.
+function dlIterPhdr() {
+    const _iter = new NativeFunction(
+        Module.getGlobalExportByName('dl_iterate_phdr'),
+        'int', ['pointer', 'pointer']);
+
+    const list = [];
+    const cb = new NativeCallback(function (info, _sz, _data) {
+        let n = '';
+        try { n = info.add(8).readPointer().readCString() || ''; } catch (_) {}
+        list.push({ addr: info.readPointer(), name: n });
+        return 0;
+    }, 'int', ['pointer', 'ulong', 'pointer']);
+
+    _iter(cb, ptr(0));
+
+    console.log(`=== dl_iterate_phdr ===  ${list.length} entries (公开 API 视角)`);
+    let hits = 0;
+    for (const e of list) {
+        if (/xiam|memfd:|frida|gadget/i.test(e.name)) {
+            console.log(`!! ${e.addr}  "${e.name}"`);
+            hits++;
+        }
+    }
+    console.log(`---- xiam/frida 命中 ${hits} / 总 ${list.length} ----`);
+    return { total: list.length, hits };
+}
+
+// ── 14) defaultNamespace: 反推 default namespace.soinfo_list_ ────────────────
+//
+//   目的: 验证 global solist + r_map 摘了之后, namespace.soinfo_list_ 是否也摘了.
+//
+//   两路:
+//   (a) 直接符号 __dl__ZL19g_default_namespace (旧 bionic 版本有).
+//   (b) 该 linker 没暴露这个符号 → 从 somain.primary_namespace_ 反推
+//       (main exe 一定在 default namespace, 其 primary_namespace_ = default ns).
+//
+//   再用 anchor (linker/libc 一定在 ns) brute-scan namespace_t 找 soinfo_list_ 偏移
+//   (LinkedList<soinfo>: { head_ @+0, tail_ @+8 }, LinkedListEntry: { next, soinfo* }).
+function _findAnchorSoinfo() {
+    try {
+        let cur = _solistHead();
+        let idx = 0;
+        while (!cur.isNull() && idx < 4096) {
+            let n = '';
+            try { n = cur.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+            if (/^linker(64)?$/.test(n) || /\/libc\.so$/.test(n) || /^libc\.so$/.test(n)) {
+                return { so: cur, name: n };
+            }
+            cur = cur.add(0x28).readPointer();
+            idx++;
+        }
+    } catch (_) {}
+    return null;
+}
+
+function _walkSoListFor(head, anchorSo) {
+    let entry = head, safe = 8192;
+    try {
+        while (!entry.isNull() && safe-- > 0) {
+            const next = entry.readPointer();
+            const elem = entry.add(8).readPointer();
+            if (elem.equals(anchorSo)) return true;
+            if (next.equals(entry)) break;
+            entry = next;
+        }
+    } catch (_) {}
+    return false;
+}
+
+// 定位 g_default_namespace 地址 + soinfo_list_ 偏移
+// 返回 { nsAddr, soOff, anchor, source }  source ∈ {'symbol', 'somain'}
+function _findNsSoinfoList() {
+    const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+    if (!linker) return null;
+    const anchor = _findAnchorSoinfo();
+    if (!anchor) return null;
+
+    // (a) 直接符号
+    const direct = linker.enumerateSymbols().find(s =>
+        /(?:^__dl_g_default_namespace$|_ZL\d+g_default_namespace$)/.test(s.name));
+    if (direct) {
+        const nsAddr = direct.address;
+        for (let off = 0; off < 0x400; off += 8) {
+            let head;
+            try { head = nsAddr.add(off).readPointer(); } catch (_) { continue; }
+            if (head.isNull()) continue;
+            if (_walkSoListFor(head, anchor.so)) {
+                return { nsAddr, soOff: off, anchor, source: 'symbol', pnsOff: -1 };
+            }
+        }
+    }
+
+    // (b) Fallback: somain.primary_namespace_ 反推
+    const somainSym = linker.enumerateSymbols().find(s => /_ZL6somain$/.test(s.name));
+    if (!somainSym) return null;
+    const somain = somainSym.address.readPointer();
+    for (let pOff = 0xf8; pOff < 0x800; pOff += 8) {
+        let P;
+        try { P = somain.add(pOff).readPointer(); } catch (_) { continue; }
+        if (P.isNull() || P.compare(ptr('0x1000')) < 0) continue;
+        try { P.readU64(); } catch (_) { continue; }
+        for (let off = 0; off < 0x200; off += 8) {
+            let head;
+            try { head = P.add(off).readPointer(); } catch (_) { continue; }
+            if (head.isNull()) continue;
+            if (_walkSoListFor(head, anchor.so)) {
+                return { nsAddr: P, soOff: off, anchor, source: 'somain', pnsOff: pOff };
+            }
+        }
+    }
+    return null;
+}
+
+// 走 ns.soinfo_list_, 找匹配 soName 的 entry, 记 prev/self/next.
+// 返回 { nsAddr, soOff, headAddr, tailAddr, head, tail, prev_entry, self_entry, next_entry,
+//        isHead, isTail, name, idx } 或 null
+function _walkNsListForName(soName) {
+    const r = _findNsSoinfoList();
+    if (!r) return null;
+    const { nsAddr, soOff } = r;
+    const headAddr = nsAddr.add(soOff);
+    const tailAddr = nsAddr.add(soOff + 8);
+    const head = headAddr.readPointer();
+    const tail = tailAddr.readPointer();
+
+    const re = new RegExp(soName, 'i');
+    let prev_entry = ptr(0);
+    let cur = head;
+    let idx = 0;
+    while (!cur.isNull() && idx < 4096) {
+        const next_entry = cur.readPointer();
+        const so = cur.add(8).readPointer();
+        let n = '';
+        if (!so.isNull()) {
+            try { n = so.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+        }
+        if (re.test(n)) {
+            return {
+                nsAddr, soOff, headAddr, tailAddr, head, tail,
+                prev_entry, self_entry: cur, next_entry,
+                isHead: cur.equals(head),
+                isTail: cur.equals(tail),
+                name: n, idx,
+            };
+        }
+        prev_entry = cur;
+        if (next_entry.equals(cur)) break;
+        cur = next_entry;
+        idx++;
+    }
+    return null;
+}
+
+function defaultNamespace() {
+    const r = _findNsSoinfoList();
+    if (!r) { console.log('定位 g_default_namespace.soinfo_list_ 失败'); return null; }
+    const { nsAddr, soOff, anchor, source, pnsOff } = r;
+    console.log(`anchor: "${anchor.name}" @ ${anchor.so}`);
+    console.log(source === 'symbol'
+        ? `g_default_namespace (符号) @ ${nsAddr}`
+        : `g_default_namespace (somain +0x${pnsOff.toString(16)} 反推) @ ${nsAddr}`);
+
+    const head = nsAddr.add(soOff).readPointer();
+    const tail = nsAddr.add(soOff + 8).readPointer();
+    console.log(`soinfo_list_ @ ns +0x${soOff.toString(16)}  head=${head}  tail=${tail}`);
+
+    let entry = head, total = 0, hits = 0;
+    const hitList = [];
+    while (!entry.isNull() && total < 4096) {
+        const next = entry.readPointer();
+        const so   = entry.add(8).readPointer();
+        let name = '';
+        if (!so.isNull()) {
+            try { name = so.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+        }
+        if (/xiam|memfd:|frida|gadget/i.test(name)) {
+            hitList.push(`[${total}] entry=${entry} so=${so}  "${name}"`);
+            hits++;
+        }
+        if (next.equals(entry)) break;
+        entry = next;
+        total++;
+    }
+    console.log(`=== namespace 视角 ===  ${total} SOs`);
+    if (hits) {
+        console.log(`!! xiam/frida 命中 ${hits}:`);
+        hitList.forEach(s => console.log('   ' + s));
+        console.log(`   xiam 仍在 g_default_namespace.soinfo_list_ — 用 removeSoList 一并摘掉`);
+    } else {
+        console.log(`✓ xiam/frida 命中 0  (namespace 视角干净)`);
+    }
+    return { ns: nsAddr, soOff, total, hits };
+}
+
+// ── 15) detect: 综合 frida 反检测全套, 打印每个命中的具体内容 ───────────────
 function detect() {
     const SUSP = /xiam|memfd:|frida|gadget|linjector/i;
     const TPATT = /frida|gum|gmain|gdbus|pool-spawner|gjs-loop/i;
     const FDPATT = /memfd:|frida|xiam|re\.frida|linjector|gadget/i;
     const FRIDA_PORTS = [27042, 27043, 14725, 14735];
 
-    const hits = { maps: [], threads: [], fds: [], linkMap: [], soList: [], ports: [], rtld: [] };
-    let mapsTotal = 0, threadsTotal = 0, fdsTotal = 0, lmTotal = 0, soTotal = 0;
+    const hits = { maps: [], threads: [], fds: [], linkMap: [], soList: [], ns: [], ports: [], rtld: [] };
+    let mapsTotal = 0, threadsTotal = 0, fdsTotal = 0, lmTotal = 0, soTotal = 0, nsTotal = 0;
 
     // ── 1) maps ──
     try {
@@ -441,6 +784,43 @@ function detect() {
         }
     } catch (_) {}
 
+    // ── 5b) g_default_namespace.soinfo_list_ ──
+    try {
+        const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
+        const anchor = _findAnchorSoinfo();
+        if (linker && anchor) {
+            let nsAddr = null, soListOff = -1;
+            const direct = linker.enumerateSymbols().find(s =>
+                /(?:^__dl_g_default_namespace$|_ZL\d+g_default_namespace$)/.test(s.name));
+            if (direct) {
+                nsAddr = direct.address;
+                for (let off = 0; off < 0x400; off += 8) {
+                    let head;
+                    try { head = nsAddr.add(off).readPointer(); } catch (_) { continue; }
+                    if (head.isNull()) continue;
+                    if (_walkSoListFor(head, anchor.so)) { soListOff = off; break; }
+                }
+            }
+            if (nsAddr && soListOff >= 0) {
+                let entry = nsAddr.add(soListOff).readPointer();
+                let i = 0;
+                while (!entry.isNull() && i < 4096) {
+                    nsTotal++;
+                    const next = entry.readPointer();
+                    const so   = entry.add(8).readPointer();
+                    let n = '';
+                    if (!so.isNull()) {
+                        try { n = so.add(0xd0 + 8).readPointer().readCString() || ''; } catch (_) {}
+                    }
+                    if (/xiam|memfd:|frida/i.test(n)) hits.ns.push(`[${i}] entry=${entry} so=${so}  "${n}"`);
+                    if (next.equals(entry)) break;
+                    entry = next;
+                    i++;
+                }
+            }
+        }
+    } catch (_) {}
+
     // ── rtld_db_dlactivity 字节对比 ──
     try {
         const linker = Process.getModuleByName('linker64') || Process.getModuleByName('linker');
@@ -503,8 +883,8 @@ function detect() {
 
     // ── 打印 ──
     const total = hits.maps.length + hits.threads.length + hits.fds.length
-                + hits.linkMap.length + hits.soList.length + hits.ports.length
-                + hits.rtld.length;
+                + hits.linkMap.length + hits.soList.length + hits.ns.length
+                + hits.ports.length + hits.rtld.length;
 
     function section(label, list, totalCount, viewHint) {
         const n = list.length;
@@ -524,6 +904,7 @@ function detect() {
     section('fds',      hits.fds,     fdsTotal,     '/proc/self/fd/*');
     section('link_map', hits.linkMap, lmTotal,      'r_debug.r_map');
     section('solist',   hits.soList,  soTotal,      'dl_iterate_phdr');
+    section('namespace',hits.ns,      nsTotal,      'g_default_namespace.soinfo_list_');
     section('rtld',     hits.rtld,    1,            'rtld_db_dlactivity 内存 vs 文件');
     section('ports',    hits.ports,   FRIDA_PORTS.length, '/proc/net/tcp LISTEN');
     console.log('────────────────────────────────────────────────────────────────────');
@@ -533,15 +914,19 @@ function detect() {
 
     return {
         maps: hits.maps.length, threads: hits.threads.length, fds: hits.fds.length,
-        linkMap: hits.linkMap.length, soList: hits.soList.length, rtld: hits.rtld.length,
-        ports: hits.ports.length, total,
+        linkMap: hits.linkMap.length, soList: hits.soList.length, ns: hits.ns.length,
+        rtld: hits.rtld.length, ports: hits.ports.length, total,
     };
 }
 
 // ── 暴露到 REPL ────────────────────────────────────────────────────────────
-rpc.exports = { maps, mapsRaw, cmdline, linkMap, soList, unlinkProbe, unlinkDo,
+rpc.exports = { maps, mapsRaw, cmdline, linkMap, soList, ldPreloads,
+                dlopenNoLoad, dlIterPhdr, defaultNamespace,
+                removeSoList,
                 threads, status, fds, ports, rtldHook, detect };
-Object.assign(globalThis, { maps, mapsRaw, cmdline, linkMap, soList, unlinkProbe, unlinkDo,
+Object.assign(globalThis, { maps, mapsRaw, cmdline, linkMap, soList, ldPreloads,
+                            dlopenNoLoad, dlIterPhdr, defaultNamespace,
+                            removeSoList,
                             threads, status, fds, ports, rtldHook, detect });
 
 console.log('[scan] loaded (no hooks installed).');
@@ -552,9 +937,12 @@ console.log('  status()       /proc/self/status 摘要');
 console.log('  threads()      线程名扫描 (frida/gum/gmain 命中)');
 console.log('  fds()          /proc/self/fd 扫描 (memfd/socket/frida 命中)');
 console.log('  ports()        本地监听端口扫描 (frida 默认端口)');
-console.log('  linkMap()      r_debug.r_map 上 xiam/memfd/frida 命中 (双链表)');
+console.log('  linkMap()      r_debug.r_map 双向遍历 (forward + reverse, 找半摘节点)');
 console.log('  soList()       solist (bionic 私有, dl_iterate_phdr 视角) 命中');
+console.log('  ldPreloads()   g_ld_preloads (LD_PRELOAD 注入清单, 正常为空)');
+console.log('  dlopenNoLoad() RTLD_NOLOAD 探 → 验证 namespace.soinfo_list_ 是否摘了');
+console.log('  dlIterPhdr()   公开 API dl_iterate_phdr (与 soList 对照)');
+console.log('  defaultNamespace() 直读 g_default_namespace.soinfo_list_ (namespace 视角)');
 console.log('  rtldHook()     ★ 对比 rtld_db_dlactivity 内存字节 vs linker 文件字节');
-console.log('  detect()       一把跑完 (maps + threads + linkMap + solist + rtld + ports)');
-console.log('  unlinkProbe()  dry-run 断链计划');
-console.log('  unlinkDo()     真断链 (单向 forward, 2 个写)');
+console.log('  detect()       一把跑完 (maps + threads + linkMap + solist + namespace + rtld + ports)');
+console.log('  removeSoList(name="xiam")  摘 solist + r_map(fwd+rev) + ns.soinfo_list_ (4~5 个写)');

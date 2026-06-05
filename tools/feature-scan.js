@@ -919,15 +919,149 @@ function detect() {
     };
 }
 
+// ── javaHook: hook 系统类方法, 检查 libart.so VMA 分裂 ──────────────────────
+//
+//   hook 目标 (均为热路径, 保证方法被 JIT 编译后再 hook 最能触发 ArtQuickCodeInterceptor):
+//     java.lang.String.hashCode()
+//     java.lang.Object.toString()
+//     android.os.SystemClock.elapsedRealtime()
+//
+//   流程:
+//     1) 快照 hook 前 libart.so 的 VMA 段列表
+//     2) Java.perform 安装 hook (TextControl 有 5ms 异步 flush)
+//     3) 等 50ms 让 flush 完成, 再拍 hook 后快照
+//     4) 对比: 段数量 / 新增 rwxp 段 / smaps Anonymous 字节数
+//
+//   调用方式: javaHook()      → hook 后 50ms 自动打印对比报告
+//             javaHook(true)  → 同上, 额外打完整 maps 行
+
+function _libartMapLines() {
+    const txt = _slurp(PROC_SELF + '/maps');
+    return txt.split('\n').filter(l => /libart\.so/.test(l));
+}
+
+function _libartSmapsAnon() {
+    // 在 smaps 里读 libart.so 对应段的 Anonymous kB 之和
+    const txt = _slurp(PROC_SELF + '/smaps');
+    const lines = txt.split('\n');
+    let inLibart = false, total = 0;
+    for (const l of lines) {
+        if (/libart\.so/.test(l)) { inLibart = true; continue; }
+        if (inLibart) {
+            if (/^[0-9a-f]/.test(l)) { inLibart = /libart\.so/.test(l); continue; }
+            const m = l.match(/^Anonymous:\s+(\d+)/);
+            if (m) total += parseInt(m[1]);
+        }
+    }
+    return total;
+}
+
+function javaHook(verbose) {
+    if (!Java.available) { console.log('[javaHook] Java 不可用'); return; }
+
+    // ── 1) 快照 hook 前 ──
+    const before = _libartMapLines();
+    const anonBefore = _libartSmapsAnon();
+    const rwxBefore = before.filter(l => / rwxp /.test(l)).length;
+
+    console.log('');
+    console.log('══════════════════════════════════════════════════════');
+    console.log('  javaHook — 安装系统类 hook, 验证 libart.so VMA 状态');
+    console.log('══════════════════════════════════════════════════════');
+    console.log(`[前] libart.so 段数: ${before.length}  rwxp: ${rwxBefore}  smaps Anonymous: ${anonBefore} kB`);
+    if (verbose) { before.forEach(l => console.log('  ' + l)); }
+
+    // ── 2) 安装 hook ──
+    let hookOk = false;
+    let hookErr = null;
+    try {
+        Java.perform(() => {
+            // String.hashCode — 极高频, JIT 必然编译过, 触发 ArtQuickCodeInterceptor
+            const String = Java.use('java.lang.String');
+            String.hashCode.implementation = function () {
+                return this.hashCode();
+            };
+
+            // Object.toString — 同上
+            const Object = Java.use('java.lang.Object');
+            Object.toString.implementation = function () {
+                return this.toString();
+            };
+
+            // SystemClock.elapsedRealtime — native static, 触发 quickGenericJniTrampoline 路径
+            const SystemClock = Java.use('android.os.SystemClock');
+            SystemClock.elapsedRealtime.implementation = function () {
+                return SystemClock.elapsedRealtime();
+            };
+        });
+        hookOk = true;
+    } catch (e) {
+        hookErr = e.message || String(e);
+    }
+
+    if (!hookOk) {
+        console.log(`[javaHook] 安装失败: ${hookErr}`);
+        return;
+    }
+    console.log('[hook] String.hashCode / Object.toString / SystemClock.elapsedRealtime 已安装');
+    console.log('[hook] 等待 TextControl 异步 flush (50ms)...');
+
+    // ── 3) 等 flush 完成再对比 ──
+    setTimeout(() => {
+        const after = _libartMapLines();
+        const anonAfter = _libartSmapsAnon();
+        const rwxAfter = after.filter(l => / rwxp /.test(l)).length;
+
+        console.log('');
+        console.log(`[后] libart.so 段数: ${after.length}  rwxp: ${rwxAfter}  smaps Anonymous: ${anonAfter} kB`);
+        if (verbose) { after.forEach(l => console.log('  ' + l)); }
+
+        // ── 4) 对比报告 ──
+        console.log('');
+        console.log('── 对比 ──────────────────────────────────────────────');
+        const segDelta = after.length - before.length;
+        const anonDelta = anonAfter - anonBefore;
+        const newRwx = after.filter(l => / rwxp /.test(l) && !before.includes(l));
+
+        if (segDelta === 0) {
+            console.log(`✓ VMA 段数无变化 (${after.length} 段) — 整段 mprotect 生效，未撕段`);
+        } else {
+            console.log(`★ VMA 段数: ${before.length} → ${after.length}  (Δ${segDelta > 0 ? '+' : ''}${segDelta}) — 撕段了!`);
+            // 找出新增的段
+            const newSegs = after.filter(l => !before.includes(l));
+            newSegs.forEach(l => console.log('  新增: ' + l));
+        }
+
+        if (newRwx.length === 0) {
+            console.log(`✓ 无新增 rwxp 段`);
+        } else {
+            console.log(`★ 新增 rwxp 段 ${newRwx.length} 条:`);
+            newRwx.forEach(l => console.log('  ' + l));
+        }
+
+        if (anonDelta === 0) {
+            console.log(`✓ smaps Anonymous 无变化 (${anonAfter} kB)`);
+        } else {
+            console.log(`⚠ smaps Anonymous: ${anonBefore} → ${anonAfter} kB  (Δ+${anonDelta} kB) — COW 副本 (预期行为)`);
+        }
+
+        console.log('──────────────────────────────────────────────────────');
+        const clean = segDelta === 0 && newRwx.length === 0;
+        console.log(`  结论: ${clean ? '✓ VMA 层面无痕' : '★ VMA 层面有痕迹'}`);
+        console.log('══════════════════════════════════════════════════════');
+        console.log('');
+    }, 50);
+}
+
 // ── 暴露到 REPL ────────────────────────────────────────────────────────────
 rpc.exports = { maps, mapsRaw, cmdline, linkMap, soList, ldPreloads,
                 dlopenNoLoad, dlIterPhdr, defaultNamespace,
                 removeSoList,
-                threads, status, fds, ports, rtldHook, detect };
+                threads, status, fds, ports, rtldHook, detect, javaHook };
 Object.assign(globalThis, { maps, mapsRaw, cmdline, linkMap, soList, ldPreloads,
                             dlopenNoLoad, dlIterPhdr, defaultNamespace,
                             removeSoList,
-                            threads, status, fds, ports, rtldHook, detect });
+                            threads, status, fds, ports, rtldHook, detect, javaHook });
 
 console.log('[scan] loaded (no hooks installed).');
 console.log('  maps()         过滤 frida/xiam 痕迹');
@@ -946,3 +1080,4 @@ console.log('  defaultNamespace() 直读 g_default_namespace.soinfo_list_ (names
 console.log('  rtldHook()     ★ 对比 rtld_db_dlactivity 内存字节 vs linker 文件字节');
 console.log('  detect()       一把跑完 (maps + threads + linkMap + solist + namespace + rtld + ports)');
 console.log('  removeSoList(name="xiam")  摘 solist + r_map(fwd+rev) + ns.soinfo_list_ (4~5 个写)');
+console.log('  javaHook()     ★ hook String/Object/SystemClock, 对比 libart.so VMA 前后 (段数/rwxp/Anonymous)');

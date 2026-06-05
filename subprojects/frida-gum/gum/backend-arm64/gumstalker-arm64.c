@@ -2154,8 +2154,19 @@ gum_exec_ctx_new (GumStalker * stalker,
   GumSlowSlab * slow_slab;
   GumDataSlab * data_slab;
 
-  base = gum_memory_allocate (NULL, stalker->ctx_size, stalker->page_size,
-      stalker->is_rwx_supported ? GUM_PAGE_RWX : GUM_PAGE_RW);
+  /* §6: reserve INT32_MAX 大块让内核挑 hole 中心，立即 free，
+   * 再在中心附近做正式分配，保证两侧各有 ~1 GiB 空间供后续
+   * gum_memory_allocate_near 分 code/slow/data slab。
+   * 不做这步，ASLR 偶尔把 ctx 塞进四周空间不足 ±128 MiB 的位置，
+   * 所有 slab 分配失败 → Stalker crash (frida-gum issue #793)。 */
+  {
+    guint8 * hole = gum_memory_allocate (NULL, INT32_MAX, stalker->page_size,
+        GUM_PAGE_RW);
+    gum_memory_free (hole, INT32_MAX);
+    base = gum_memory_allocate (hole + INT32_MAX / 2, stalker->ctx_size,
+        stalker->page_size,
+        stalker->is_rwx_supported ? GUM_PAGE_RWX : GUM_PAGE_RW);
+  }
 
   ctx = (GumExecCtx *) base;
 

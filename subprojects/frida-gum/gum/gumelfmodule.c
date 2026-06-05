@@ -22,6 +22,12 @@
 #endif
 
 #include <string.h>
+#ifdef G_OS_UNIX
+# include <fcntl.h>
+# include <sys/mman.h>
+# include <sys/stat.h>
+# include <unistd.h>
+#endif
 
 #define GUM_ELF_DEFAULT_MAPPED_SIZE (64 * 1024)
 #define GUM_ELF_PAGE_START(value, page_size) \
@@ -262,6 +268,9 @@ static guint64 gum_elf_module_read_uint64 (GumElfModule * self,
 
 static GBytes * gum_decompress_xz (gconstpointer data, gsize size);
 
+#ifdef G_OS_UNIX
+static GBytes * gum_load_file_into_buffer (const gchar * path);
+#endif
 static gboolean gum_maybe_extract_from_apk (const gchar * path,
     GBytes ** file_bytes);
 
@@ -559,24 +568,13 @@ gum_elf_module_load (GumElfModule * self,
 #endif
     if (!gum_maybe_extract_from_apk (self->source_path, &self->file_bytes))
     {
-      GMappedFile * file;
       gconstpointer data;
       gsize size;
       GumMemoryRange r;
 
-      file = g_mapped_file_new (self->source_path, FALSE, &local_error);
-      if (file != NULL)
-      {
-        self->file_bytes = g_mapped_file_get_bytes (file);
-        g_mapped_file_unref (file);
-
-        data = g_bytes_get_data (self->file_bytes, &size);
-        r.base_address = GUM_ADDRESS (data);
-        r.size = GUM_ALIGN_SIZE (size, gum_query_page_size ());
-        gum_cloak_add_range (&r);
-        self->file_mapped_range = r;
-      }
-      else
+#ifdef G_OS_UNIX
+      self->file_bytes = gum_load_file_into_buffer (self->source_path);
+      if (self->file_bytes == NULL)
       {
         if (self->source_mode == GUM_ELF_SOURCE_MODE_OFFLINE)
           goto unable_to_open;
@@ -585,6 +583,32 @@ gum_elf_module_load (GumElfModule * self,
             GSIZE_TO_POINTER (self->base_address),
             G_MAXSIZE - self->base_address);
       }
+#else
+      {
+        GMappedFile * file = g_mapped_file_new (self->source_path, FALSE,
+            &local_error);
+        if (file != NULL)
+        {
+          self->file_bytes = g_mapped_file_get_bytes (file);
+          g_mapped_file_unref (file);
+        }
+        else
+        {
+          if (self->source_mode == GUM_ELF_SOURCE_MODE_OFFLINE)
+            goto unable_to_open;
+
+          self->file_bytes = g_bytes_new_static (
+              GSIZE_TO_POINTER (self->base_address),
+              G_MAXSIZE - self->base_address);
+        }
+      }
+#endif
+
+      data = g_bytes_get_data (self->file_bytes, &size);
+      r.base_address = GUM_ADDRESS (data);
+      r.size = GUM_ALIGN_SIZE (size, gum_query_page_size ());
+      gum_cloak_add_range (&r);
+      self->file_mapped_range = r;
     }
   }
 
@@ -2627,6 +2651,77 @@ gum_decompress_xz (gconstpointer data,
   return NULL;
 #endif
 }
+
+#ifdef G_OS_UNIX
+
+typedef struct {
+  gpointer data;
+  gsize size;
+} GumAnonBuf;
+
+static void
+gum_anon_buf_free (gpointer mem)
+{
+  GumAnonBuf * b = mem;
+  munmap (b->data, b->size);
+  g_free (b);
+}
+
+static GBytes *
+gum_load_file_into_buffer (const gchar * path)
+{
+  int fd;
+  struct stat st;
+  gsize size;
+  gpointer m;
+  GumAnonBuf * b;
+
+  fd = open (path, O_RDONLY);
+  if (fd < 0)
+    return NULL;
+
+  if (fstat (fd, &st) < 0 || st.st_size == 0)
+  {
+    close (fd);
+    return NULL;
+  }
+
+  size = (gsize) st.st_size;
+
+  /* 匿名映射：/proc/self/maps 里无文件路径，跟普通堆分配看起来一样 */
+  m = mmap (NULL, size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED)
+  {
+    close (fd);
+    return NULL;
+  }
+
+  {
+    gsize remaining = size;
+    guint8 * ptr = m;
+    while (remaining > 0)
+    {
+      gssize n = read (fd, ptr, remaining);
+      if (n <= 0)
+        break;
+      ptr += n;
+      remaining -= n;
+    }
+  }
+  close (fd);
+
+  /* 降权到只读，防止意外写入 */
+  mprotect (m, size, PROT_READ);
+
+  b = g_new (GumAnonBuf, 1);
+  b->data = m;
+  b->size = size;
+
+  return g_bytes_new_with_free_func (m, size, gum_anon_buf_free, b);
+}
+
+#endif /* G_OS_UNIX */
 
 static gboolean
 gum_maybe_extract_from_apk (const gchar * path,

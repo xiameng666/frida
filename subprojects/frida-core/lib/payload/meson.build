@@ -22,6 +22,12 @@ if host_os_family == 'linux'
   payload_sources += 'syscall-linux-@0@.S'.format(host_arch)
 endif
 
+if host_os == 'android' and host_arch == 'arm64'
+  payload_sources += [
+    'stealth-hide.c',
+  ]
+endif
+
 extra_c_args = []
 extra_vala_args = []
 if host_os_family != 'windows'

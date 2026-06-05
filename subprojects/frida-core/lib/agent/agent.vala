@@ -129,6 +129,12 @@ namespace Frida.Agent {
 				if (cached_agent_path == null) {
 					cached_agent_range = detect_own_range_and_path (mapped_range, out cached_agent_path);
 					Gum.Cloak.add_range (cached_agent_range);
+#if ANDROID && ARM64
+					/* Hide frida-agent from bionic solist + r_debug.r_map.
+					 * Must run early, before any background threads are spawned,
+					 * and after base_address is known. */
+					Frida.Stealth.hide_self_from_linker ((void *) cached_agent_range.base_address);
+#endif
 				}
 
 				var fdt_padder = FileDescriptorTablePadder.obtain ();

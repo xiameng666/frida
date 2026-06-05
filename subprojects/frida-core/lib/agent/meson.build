@@ -18,6 +18,12 @@ endif
 if host_os_family == 'darwin'
   extra_vala_args += '--pkg=frida-gum-darwin-1.0'
 endif
+if host_os == 'android' and host_arch == 'arm64'
+  extra_vala_args += [
+    '--vapidir=' + (meson.current_source_dir() / '../payload'),
+    '--pkg=stealth',
+  ]
+endif
 
 if host_os_family == 'windows'
   if host_toolchain != 'microsoft'

@@ -223,12 +223,17 @@ load_linker_symbols (void)
       {
         if (!strstr (line, "r-xp"))
           continue;
-        const char * p = strstr (line, "/linker64");
-        if (!p)
-          p = strstr (line, "/linker");
+        /* Require "linker64" or "/linker" anywhere in the path part */
+        if (!strstr (line, "linker64") && !strstr (line, "/linker"))
+          continue;
+        /* Extract the full path: find first '/' after the permissions field */
+        const char * p = strchr (line, '/');
         if (!p)
           continue;
-        /* extract path (trim newline) */
+        /* Sanity: the path must actually contain linker64 or /linker */
+        if (!strstr (p, "linker64") && !strstr (p, "/linker"))
+          continue;
+        /* trim newline */
         size_t len = strlen (p);
         if (len > 0 && p[len - 1] == '\n')
           len--;

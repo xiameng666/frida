@@ -36,6 +36,7 @@ typedef struct {
   void        * mapping;
   size_t        mapping_size;
   uintptr_t     load_base;   /* runtime base: mapping_start - mapping_offset */
+  uintptr_t     bias;        /* first PT_LOAD: p_vaddr - p_offset; 0 for PIE  */
   Elf64_Ehdr  * ehdr;
   Elf64_Shdr  * shdrs;
   const char  * shstrtab;
@@ -106,13 +107,13 @@ frida_elf_img_open (const char * path, FridaElfImg * img)
   Elf64_Shdr * shstr_hdr = &img->shdrs[ehdr->e_shstrndx];
   img->shstrtab = (const char *) m + shstr_hdr->sh_offset;
 
-  /* Compute bias from first PT_LOAD: bias = p_vaddr - p_offset (PIE → 0) */
+  /* bias = first PT_LOAD's (p_vaddr - p_offset); 0 for standard PIE */
   Elf64_Phdr * phdrs = (Elf64_Phdr *) ((char *) m + ehdr->e_phoff);
   for (int i = 0; i < ehdr->e_phnum; i++)
     {
       if (phdrs[i].p_type == PT_LOAD)
         {
-          /* bias absorbed into load_base already; nothing extra needed */
+          img->bias = (uintptr_t) phdrs[i].p_vaddr - (uintptr_t) phdrs[i].p_offset;
           break;
         }
     }
@@ -162,8 +163,8 @@ frida_elf_img_find (FridaElfImg * img, const char * sym_name)
       if (strcmp (strtab + s->st_name, sym_name) != 0)
         continue;
 
-      uintptr_t addr = img->load_base + s->st_value;
-      /* Sanity: within ±32 MiB of load_base */
+      uintptr_t addr = img->load_base + s->st_value - img->bias;
+      /* Sanity: within 32 MiB of load_base */
       if (addr < img->load_base || addr > img->load_base + 32 * 1024 * 1024)
         return 0;
       return addr;
